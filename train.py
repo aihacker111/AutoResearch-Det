@@ -61,6 +61,48 @@ import json, os, sys, time
 from pathlib import Path
 
 
+def _resolve_weights_arg() -> str:
+    """Absolute path to weights under this script's directory (stable for download + load)."""
+    name = f"yolo11{MODEL_SIZE}.pt" if PRETRAINED else f"yolo11{MODEL_SIZE}.yaml"
+    p = Path(name)
+    if not p.is_absolute():
+        p = Path(__file__).resolve().parent / p
+    return str(p.resolve())
+
+
+def _load_yolo(weights_arg: str):
+    """
+    Construct YOLO(weights). Uses an exclusive lock so torch.distributed workers
+    do not download the same .pt concurrently (corrupts the zip / PytorchStreamReader).
+    """
+    from ultralytics import YOLO
+
+    root = Path(__file__).resolve().parent
+    lock_path = root / ".ultralytics_yolo_init.lock"
+    lock_f = open(lock_path, "a+", encoding="utf-8")
+    try:
+        if sys.platform != "win32":
+            import fcntl
+
+            fcntl.flock(lock_f, fcntl.LOCK_EX)
+        try:
+            try:
+                return YOLO(weights_arg)
+            except RuntimeError as exc:
+                err = str(exc).lower()
+                if "pytorchstreamreader" in err or "failed reading" in err:
+                    wp = Path(weights_arg)
+                    if wp.suffix == ".pt" and wp.is_file():
+                        wp.unlink()
+                        return YOLO(weights_arg)
+                raise
+        finally:
+            if sys.platform != "win32":
+                fcntl.flock(lock_f, fcntl.LOCK_UN)
+    finally:
+        lock_f.close()
+
+
 def _resolve_data_yaml() -> str:
     """Resolve DATA_YAML relative to this file; optional DATA_YAML env override."""
     raw = os.environ.get("DATA_YAML", DATA_YAML)
@@ -87,8 +129,8 @@ def main():
     except ImportError:
         sys.exit("ERROR: pip install ultralytics torch")
 
-    weights = f"yolo11{MODEL_SIZE}.pt" if PRETRAINED else f"yolo11{MODEL_SIZE}.yaml"
-    model   = YOLO(weights)
+    weights = _resolve_weights_arg()
+    model   = _load_yolo(weights)
 
     output_dir = os.environ.get("OUTPUT_DIR", "output/train")
     torch.cuda.reset_peak_memory_stats()
@@ -143,7 +185,7 @@ def main():
     map50   = float(metrics.get("metrics/mAP50(B)",    0.0))
 
     summary = {
-        "model"        : weights,
+        "model"        : Path(weights).name,
         "val_mAP5095"  : map5095,
         "val_mAP50"    : map50,
         "epochs"       : EPOCHS,
