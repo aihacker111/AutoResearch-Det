@@ -47,9 +47,9 @@ _LLM_RETRIES    = 3
 _LLM_RETRY_WAIT = 5   # seconds between retries
 
 # Runtime globals
-OPENROUTER_API_KEY: str = ""
+OPENROUTER_API_KEY: str = "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"
 LLM_MODEL:          str = _DEFAULT_MODEL
-NUM_GPUS:           int = 1
+NUM_GPUS:           int = 2
 _shutdown_requested:bool = False
 
 
