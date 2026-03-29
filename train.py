@@ -129,14 +129,15 @@ def main():
     except ImportError:
         sys.exit("ERROR: pip install ultralytics torch")
 
-    weights = _resolve_weights_arg()
-    model   = _load_yolo(weights)
+    try:
+        weights = _resolve_weights_arg()
+        model   = _load_yolo(weights)
 
-    output_dir = os.environ.get("OUTPUT_DIR", "output/train")
-    torch.cuda.reset_peak_memory_stats()
-    t0 = time.time()
+        output_dir = os.environ.get("OUTPUT_DIR", "output/train")
+        torch.cuda.reset_peak_memory_stats()
+        t0 = time.time()
 
-    results = model.train(
+        results = model.train(
         data            = _resolve_data_yaml(),
         epochs          = EPOCHS,
         patience        = PATIENCE,
@@ -172,37 +173,45 @@ def main():
         exist_ok        = True,
         verbose         = True,
         plots           = False,
-    )
+        )
 
-    elapsed   = time.time() - t0
-    peak_vram = (
-        torch.cuda.max_memory_allocated() / 1024**2
-        if torch.cuda.is_available() else 0.0
-    )
+        elapsed   = time.time() - t0
+        peak_vram = (
+            torch.cuda.max_memory_allocated() / 1024**2
+            if torch.cuda.is_available() else 0.0
+        )
 
-    metrics = results.results_dict if hasattr(results, "results_dict") else {}
-    map5095 = float(metrics.get("metrics/mAP50-95(B)", 0.0))
-    map50   = float(metrics.get("metrics/mAP50(B)",    0.0))
+        metrics = results.results_dict if hasattr(results, "results_dict") else {}
+        map5095 = float(metrics.get("metrics/mAP50-95(B)", 0.0))
+        map50   = float(metrics.get("metrics/mAP50(B)",    0.0))
 
-    summary = {
-        "model"        : Path(weights).name,
-        "val_mAP5095"  : map5095,
-        "val_mAP50"    : map50,
-        "epochs"       : EPOCHS,
-        "training_sec" : round(elapsed, 1),
-        "peak_vram_mb" : round(peak_vram, 1),
-    }
-    exp_dir = Path(output_dir) / "exp"
-    exp_dir.mkdir(parents=True, exist_ok=True)
-    (exp_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+        summary = {
+            "model"        : Path(weights).name,
+            "val_mAP5095"  : map5095,
+            "val_mAP50"    : map50,
+            "epochs"       : EPOCHS,
+            "training_sec" : round(elapsed, 1),
+            "peak_vram_mb" : round(peak_vram, 1),
+        }
+        exp_dir = Path(output_dir) / "exp"
+        exp_dir.mkdir(parents=True, exist_ok=True)
+        (exp_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
-    print("---")
-    print(f"val_mAP5095:      {map5095:.6f}")
-    print(f"val_mAP50:        {map50:.6f}")
-    print(f"training_epochs:  {EPOCHS}")
-    print(f"training_seconds: {elapsed:.1f}")
-    print(f"peak_vram_mb:     {peak_vram:.1f}")
-    print(f"checkpoint:       {exp_dir / 'weights/best.pt'}")
+        print("---")
+        print(f"val_mAP5095:      {map5095:.6f}")
+        print(f"val_mAP50:        {map50:.6f}")
+        print(f"training_epochs:  {EPOCHS}")
+        print(f"training_seconds: {elapsed:.1f}")
+        print(f"peak_vram_mb:     {peak_vram:.1f}")
+        print(f"checkpoint:       {exp_dir / 'weights/best.pt'}")
+    finally:
+        try:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

@@ -544,56 +544,130 @@ def _parse_llm_proposal(raw_text: str) -> dict:
 # ── Experiment proposal ───────────────────────────────────────────────────────
 
 def propose_experiment(history: list[dict], current_code: str) -> dict:
+    
+    # ── 1. Phân tích history để tạo context thông minh hơn ──
+    kept    = [h for h in history if h["status"] == "keep"]
+    crashed = [h for h in history if h["status"] == "crash"]
+    discarded = [h for h in history if h["status"] == "discard"]
+    best_map = max((h["val_mAP5095"] for h in history), default=0.0)
+    baseline = history[0]["val_mAP5095"] if history else 0.0
+    
+    # Tính average delta của 3 lần gần nhất → detect plateau
+    recent = history[-3:]
+    if len(recent) >= 2:
+        deltas = [recent[i]["val_mAP5095"] - recent[i-1]["val_mAP5095"]
+                  for i in range(1, len(recent))]
+        avg_delta = sum(deltas) / len(deltas)
+    else:
+        avg_delta = 0.0
+
+    # ── 2. History block có cấu trúc, bao gồm trend ──
     history_block = "\n".join(
-        f"  exp{i+1:02d}: {h['description']}  ->  "
-        f"mAP50-95={h['val_mAP5095']:.4f}  ({h['status']})"
+        f"  exp{i+1:02d}: [{h['status'].upper():7s}] "
+        f"mAP={h['val_mAP5095']:.4f}  "
+        f"delta={h['val_mAP5095'] - (history[i-1]['val_mAP5095'] if i > 0 else baseline):+.4f}  "
+        f"| {h['description']}"
         for i, h in enumerate(history)
-    ) or "  (none yet -- this will be the baseline)"
+    ) or "  (none yet — this is the baseline run)"
+
+    trend_note = (
+        f"Recent avg Δ={avg_delta:+.4f}. "
+        + ("PLATEAU detected — consider a bigger/bolder change." if avg_delta < 0.001 else
+           "Positive trend — fine-tune around what's working.")
+    )
+
+    params_tried = [h["description"] for h in history[1:]]  # skip baseline
+    params_tried_str = "; ".join(params_tried) if params_tried else "none yet"
+
+    # ── 3. Extract dataset info từ current_code nếu có ──
+    import re
+    def _extract(pattern, src, default="unknown"):
+        m = re.search(pattern, src, re.MULTILINE)
+        return m.group(1).strip() if m else default
+
+    num_classes  = _extract(r"^NC\s*=\s*(\d+)",       current_code)
+    dataset_size = _extract(r"^DATASET_SIZE\s*=\s*(.+)", current_code)
 
     code_chars = len(current_code)
     fixed_str  = ", ".join(_FIXED_PARAMS)
 
-        system_prompt = (
-        "You are an expert computer vision researcher optimising YOLO11 "
-        "fine-tuning on a small custom dataset.\n"
-        f"Goal: maximise val/mAP50-95. Training runs on {NUM_GPUS} GPU(s).\n\n"
+    # ── 4. System prompt với domain knowledge mạnh hơn ──
+    system_prompt = (
+        "You are a expert computer vision researcher specialising in YOLO fine-tuning "
+        "Your goal is to maximise val/mAP50-95 "
+        f"on a dataset with {num_classes} classes (~{dataset_size} images) "
+        f"using {NUM_GPUS} GPU(s).\n\n"
 
-        "OUTPUT FORMAT -- reply with ONLY this JSON object, nothing else:\n"
-        '  {"description": "one-line summary", "new_code": "<complete train.py>"}\n\n'
+        # --- Chain-of-thought yêu cầu ---
+        "REASONING PROTOCOL:\n"
+        "Before choosing a hyperparameter, think step by step:\n"
+        "  1. What does the current best mAP tell you about underfitting vs overfitting?\n"
+        "  2. What have the kept/discarded experiments revealed so far?\n"
+        "  3. Is the search plateauing? (use the trend note provided)\n"
+        "  4. Which single change has the highest expected impact given the above?\n"
+        "Encode your reasoning in the 'description' field (max 200 chars), "
+        "formatted as: 'REASON: <why> | CHANGE: <what> | EXPECTED: <effect>'\n\n"
 
-        "CRITICAL JSON ENCODING RULES for the new_code value:\n"
+        # --- Format output ---
+        "OUTPUT FORMAT — reply with ONLY this JSON object, nothing else:\n"
+        '  {"description": "REASON: ... | CHANGE: ... | EXPECTED: ...", '
+        '"new_code": "<complete train.py>"}\n\n'
+
+        "CRITICAL JSON ENCODING RULES for new_code:\n"
         "  1. Every newline -> \\n\n"
         "  2. Every double-quote -> \\\"\n"
         "  3. Every backslash -> \\\\\n"
         "  4. Must be valid json.loads()\n"
         "  5. Do NOT use triple-quotes or markdown fences\n\n"
 
-        "CONTENT RULES (VERY STRICT):\n"
-        "  - The Python file starts with a triple-quoted docstring on the very first line\n"
-        "  - ONLY modify constants in the config section (above the '# Do NOT edit below this line' comment)\n"
-        "  - You MUST change EXACTLY ONE hyperparameter\n"
-        "    OR one closely related group (allowed groups are listed below).\n"
-        "    This is critical for clear attribution of which change improved the metric.\n\n"
-        "Allowed related groups (only these):\n"
-        "  • HSV_H, HSV_S, HSV_V\n"
-        "  • DEGREES, TRANSLATE, SCALE, SHEAR\n"
-        "  • MOSAIC, MIXUP, COPY_PASTE\n"
-        "  • LR0, LRF\n"
-        "  • WARMUP_EPOCHS, WARMUP_BIAS_LR\n"
-        "  • DROPOUT, LABEL_SMOOTHING\n"
-        f"  - Do NOT change {fixed_str} -- these are fixed across ALL experiments\n"
-        "  - Current file is {code_chars} characters; new_code must be similar in size\n"
-        "  - Use ONLY printable ASCII characters (no Unicode)\n"
+        # --- Domain knowledge về từng param ---
+        "HYPERPARAMETER PRIORITY TABLE (for small datasets):\n"
+        "┌─────────────────────┬──────────┬──────┬─────────────────────────────────┐\n"
+        "│ Parameter           │ Impact   │ Risk │ When to use                     │\n"
+        "├─────────────────────┼──────────┼──────┼─────────────────────────────────┤\n"
+        "│ LR0                 │ HIGH     │ MED  │ First to tune; try 1e-3..1e-4   │\n"
+        "│ LR0+LRF (group)     │ HIGH     │ MED  │ When LR0 alone doesn't converge │\n"
+        "│ MOSAIC              │ HIGH     │ LOW  │ Overfitting? Disable (0.0)       │\n"
+        "│ CLOSE_MOSAIC        │ MED      │ LOW  │ Tune when mosaic hurts final ep  │\n"
+        "│ WEIGHT_DECAY        │ MED      │ LOW  │ High when overfitting            │\n"
+        "│ OPTIMIZER           │ MED      │ LOW  │ SGD vs AdamW on small data       │\n"
+        "│ WARMUP_EPOCHS       │ MED      │ LOW  │ Increase if loss spikes early    │\n"
+        "│ DROPOUT             │ LOW-MED  │ LOW  │ Only if clear overfitting        │\n"
+        "│ LABEL_SMOOTHING     │ LOW      │ LOW  │ Class imbalance present          │\n"
+        "│ HSV_H/S/V (group)   │ LOW-MED  │ LOW  │ When images vary in lighting     │\n"
+        "│ MIXUP/COPY_PASTE    │ MED      │ LOW  │ After mosaic is tuned            │\n"
+        "│ PATIENCE            │ NONE     │ NONE │ Don't tune — affects budget      │\n"
+        "└─────────────────────┴──────────┴──────┴─────────────────────────────────┘\n\n"
+
+        "CONTENT RULES (STRICT):\n"
+        f"  - Do NOT change: {fixed_str}\n"
+        "  - Change EXACTLY ONE param OR one allowed group (HSV_H/S/V; "
+        "DEGREES/TRANSLATE/SCALE/SHEAR; MOSAIC/MIXUP/COPY_PASTE; "
+        "LR0/LRF; WARMUP_EPOCHS/WARMUP_BIAS_LR; DROPOUT/LABEL_SMOOTHING)\n"
+        f"  - new_code must be {code_chars}±200 characters\n"
+        "  - ASCII only (no Unicode)\n"
+        "  - File must start with a triple-quoted docstring\n"
     )
 
+    # ── 5. User prompt với context đầy đủ ──
     user_prompt = (
-        f"Experiment history:\n{history_block}\n\n"
-        f"Current train.py ({code_chars} chars):\n{current_code}\n\n"
-        "Pick EXACTLY ONE change (or one allowed related group) most likely to improve val/mAP50-95.\n"
-        "Good candidates: LR0, LRF, OPTIMIZER, MOMENTUM, WEIGHT_DECAY, "
-        "WARMUP_EPOCHS, WARMUP_BIAS_LR, DROPOUT, LABEL_SMOOTHING, "
-        "MOSAIC, MIXUP, COPY_PASTE, CLOSE_MOSAIC, PATIENCE, MODEL_SIZE.\n"
-        "Return the COMPLETE modified train.py as new_code."
+        f"=== EXPERIMENT HISTORY ({len(history)} runs) ===\n"
+        f"{history_block}\n\n"
+        f"=== TREND ANALYSIS ===\n"
+        f"  Baseline mAP  : {baseline:.4f}\n"
+        f"  Best mAP so far: {best_map:.4f}  (+{best_map-baseline:+.4f})\n"
+        f"  Kept / Discarded / Crashed: {len(kept)} / {len(discarded)} / {len(crashed)}\n"
+        f"  {trend_note}\n"
+        f"  Already tried  : {params_tried_str}\n\n"
+        f"=== CURRENT train.py ({code_chars} chars) ===\n"
+        f"{current_code}\n\n"
+        "=== YOUR TASK ===\n"
+        "Step 1 — Diagnose: Is the model underfitting or overfitting? "
+        "What does the kept/discarded pattern suggest?\n"
+        "Step 2 — Select: Pick ONE change (or one group) with highest expected mAP50-95 gain. "
+        "Do NOT repeat a change already attempted.\n"
+        "Step 3 — Output: Return the complete modified train.py as new_code.\n"
+        "Your description MUST follow: 'REASON: <why> | CHANGE: <what> | EXPECTED: <effect>'"
     )
 
     messages = [
@@ -865,29 +939,78 @@ def run_training(
     return _launch_training(cmd, timeout, env)
 
 
-def parse_metrics() -> dict[str, float]:
-    """Parse metrics từ summary.json mà train.py đã ghi sẵn."""
+def _resolve_train_output_dir() -> Path:
+    """Same root as training subprocess (cwd=_ROOT); fixes Kaggle when autoresearch cwd != repo."""
+    raw = os.environ.get("OUTPUT_DIR", "output/train")
+    p = Path(raw)
+    if not p.is_absolute():
+        p = _ROOT / p
+    return p.resolve()
+
+
+def _parse_metrics_from_run_log() -> tuple[dict[str, float], bool]:
+    """Fallback: lines printed by train.py (--- / val_mAP5095: / ...)."""
+    metrics: dict[str, float] = {
+        "val_mAP5095" : 0.0,
+        "val_mAP50"   : 0.0,
+        "peak_vram_mb": 0.0,
+    }
+    try:
+        text = Path(_LOG_FILE).read_text(errors="ignore")
+    except FileNotFoundError:
+        return metrics, False
+    for line in text.splitlines():
+        for key in metrics:
+            m = re.match(rf"^{re.escape(key)}:\s+([\d.]+)", line.strip())
+            if m:
+                metrics[key] = float(m.group(1))
+    # Training finished and printed the summary block (mAP may legitimately be 0)
+    ok = re.search(r"^val_mAP5095:\s+[\d.]+", text, re.MULTILINE) is not None
+    return metrics, ok
+
+
+def parse_metrics() -> tuple[dict[str, float], bool]:
+    """
+    Read train.py metrics: summary.json under OUTPUT_DIR (anchored to _ROOT), then run.log.
+    Second value is True if metrics were read successfully (including mAP legitimately 0).
+    """
     metrics: dict[str, float] = {
         "val_mAP5095" : 0.0,
         "val_mAP50"   : 0.0,
         "peak_vram_mb": 0.0,
     }
 
-    output_dir = os.environ.get("OUTPUT_DIR", "output/train")
-    summary_path = Path(output_dir) / "exp" / "summary.json"   # ← Đường dẫn tới file
+    base = _resolve_train_output_dir()
+    # Ultralytics may create exp, exp2, ... — prefer newest summary.json
+    candidates = sorted(
+        base.glob("exp*/summary.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
 
-    if summary_path.is_file():
+    for summary_path in candidates:
         try:
-            data = json.loads(summary_path.read_text(encoding="utf-8"))   # ← DÒNG NÀY ĐỌC FILE
+            data = json.loads(summary_path.read_text(encoding="utf-8"))
             metrics["val_mAP5095"] = float(data.get("val_mAP5095", 0.0))
-            metrics["val_mAP50"]   = float(data.get("val_mAP50", 0.0))
+            metrics["val_mAP50"] = float(data.get("val_mAP50", 0.0))
             metrics["peak_vram_mb"] = float(data.get("peak_vram_mb", 0.0))
+            return metrics, True
         except Exception as e:
-            print(f"  [parse_metrics] warning: cannot read summary.json ({e})")
-    else:
-        print(f"  [parse_metrics] warning: summary.json not found at {summary_path}")
+            print(f"  [parse_metrics] warning: cannot read {summary_path} ({e})")
 
-    return metrics
+    log_metrics, log_ok = _parse_metrics_from_run_log()
+    if log_ok:
+        print(
+            "  [parse_metrics] note: using metrics from run.log "
+            f"(no usable summary.json under {base})"
+        )
+        return log_metrics, True
+
+    print(
+        f"  [parse_metrics] warning: no summary.json under {base} "
+        f"(exp*/summary.json) and no metrics in {_LOG_FILE}"
+    )
+    return metrics, False
 
 
 # ── Results file ──────────────────────────────────────────────────────────────
@@ -1085,16 +1208,22 @@ def main() -> None:
         if exp_num == 1:
             baseline_time = elapsed
 
-        metrics     = parse_metrics()
+        metrics, metrics_ok = parse_metrics()
         val_mAP5095 = metrics["val_mAP5095"]
 
         print()
-        if not success or val_mAP5095 == 0.0:
+        if not metrics_ok:
             print(f"  X  CRASH  ({elapsed:.0f}s)  -- see {_LOG_FILE}")
             append_result(commit, metrics, "crash", description)
             history.append({"description": description, "val_mAP5095": 0.0, "status": "crash"})
             git_reset_last()
             continue
+
+        if not success:
+            print(
+                "  [!] Training subprocess exited non-zero but metrics were recovered "
+                "(often NCCL / DDP teardown). Continuing with parsed metrics."
+            )
 
         prev = history[-1]["val_mAP5095"] if history else 0.0
         print(
