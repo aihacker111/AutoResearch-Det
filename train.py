@@ -9,14 +9,14 @@ Task    : object detection, fine-tuning from COCO pretrained weights
 """
 
 # -- Model ---------------------------------------------------------------------
-MODEL_SIZE = "n"        # "n" | "s" | "m" | "l" | "x"
+MODEL_SIZE = "m"        # "n" | "s" | "m" | "l" | "x"
 PRETRAINED = True       # start from COCO pretrained weights
 
 # -- Dataset -------------------------------------------------------------------
 DATA_YAML  = "data.yaml"
 
 # -- Training schedule ---------------------------------------------------------
-EPOCHS        = 1
+EPOCHS        = 30
 PATIENCE      = 15          # ^ slightly more tolerance
 IMGSZ         = 640
 CLOSE_MOSAIC  = 15          # ^ disable mosaic earlier for small-data stability
