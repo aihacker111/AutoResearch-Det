@@ -20,6 +20,7 @@ C) YOLO flat (labels already converted):
 Usage
 -----
     python prepare.py --dataset-dir /path/to/dataset
+    python prepare.py --dataset-dir /kaggle/input/ds --staging-dir /kaggle/working/prepared
     python prepare.py --eval --weights output/train/exp/weights/best.pt
     python prepare.py --verify
 """
@@ -29,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from collections import defaultdict
@@ -198,33 +200,72 @@ def _convert_coco_to_yolo(json_path: Path, labels_dir: Path) -> int:
     if skipped_bbox: print(f"          skipped {skipped_bbox} zero-size bboxes")
     return written
 
+
+def _rel_under_root(base: Path, p: Path) -> str:
+    """Relative path when p is under base; else absolute string."""
+    base, p = base.resolve(), p.resolve()
+    try:
+        return str(p.relative_to(base))
+    except ValueError:
+        return str(p)
+
+
+def _stage_images_into(src_images: Path, staging_root: Path, split: str) -> Path:
+    """
+    Copy or symlink all images from src into staging_root/images/<split>/.
+    Returns the destination images directory.
+    """
+    dst = staging_root / "images" / split
+    dst.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for ext in ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG"):
+        for src in sorted(src_images.glob(ext)):
+            out = dst / src.name
+            if out.exists():
+                n += 1
+                continue
+            try:
+                out.symlink_to(src.resolve())
+            except OSError:
+                shutil.copy2(src, out)
+            n += 1
+    print(f"[prepare] staged {n} images  {src_images}  →  {dst}")
+    return dst
+
+
 def _labels_dir_for(root: Path, split: str, images_dir: Path) -> Path:
     """
-    Derive the labels directory path from the images directory.
+    Derive the labels directory from the images directory layout.
 
-    If root is read-only (e.g. /kaggle/input), labels are redirected to
-    a writable sibling: /kaggle/working/labels/<dataset_name>/<split>
-    Otherwise:
-      - train/images/ → train/labels/
-      - images/train/ → labels/train/
-      - train/        → labels/train/  (VisDrone style)
+    Prefer paths derived from images_dir (so staging/images/train → staging/labels/train)
+    before any read-only fallback — otherwise Kaggle input + labels in /working/labels
+    breaks train/val paths in data.yaml.
+
+    Layouts:
+      - .../images/<split> or .../<split>/images/ → replace first /images/ with /labels/
+      - root/<split>/images (Roboflow) → root/<split>/labels
+      - VisDrone-style root/<split> (images only) → root/labels/<split> or LABELS_DIR if read-only
     """
-    # ── Read-only root guard ──────────────────────────────────────────────────
-    try:
-        root.stat()
-        test_file = root / ".write_test"
-        test_file.touch()
-        test_file.unlink()
-    except (OSError, PermissionError):
-        # Root is read-only → write labels next to the working script
-        working_dir = Path(os.environ.get("LABELS_DIR", "labels"))
-        return working_dir / root.name / split
-
-    # ── Writable root: keep labels near images ────────────────────────────────
-    img_str = str(images_dir)
+    img_str = str(images_dir.resolve())
     if "/images/" in img_str or img_str.endswith("/images"):
         return Path(img_str.replace("/images", "/labels", 1))
-    return root / "labels" / split
+
+    roboflow_split = root / split / "images"
+    try:
+        if images_dir.resolve() == roboflow_split.resolve():
+            return root / split / "labels"
+    except OSError:
+        pass
+
+    default = root / "labels" / split
+    try:
+        test_file = root / ".write_test_prepare"
+        test_file.touch()
+        test_file.unlink()
+        return default
+    except (OSError, PermissionError):
+        working_dir = Path(os.environ.get("LABELS_DIR", "labels"))
+        return working_dir / root.name / split
 
 
 def _ensure_yolo_labels(root: Path, split: str, images_dir: Path) -> Path | None:
@@ -249,7 +290,11 @@ def _ensure_yolo_labels(root: Path, split: str, images_dir: Path) -> Path | None
 # Main: build data.yaml
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def build_data_yaml(dataset_dir: str, output: str = "data.yaml") -> dict:
+def build_data_yaml(
+    dataset_dir: str,
+    output: str = "data.yaml",
+    staging_dir: str | None = None,
+) -> dict:
     root = Path(dataset_dir).resolve()
     assert root.exists(), f"Dataset not found: {root}"
 
@@ -272,7 +317,7 @@ def build_data_yaml(dataset_dir: str, output: str = "data.yaml") -> dict:
     nc    = len(class_map)
     names = [class_map[i] for i in range(nc)]
 
-    # ── Resolve image directories ─────────────────────────────────────────────
+    # ── Resolve image directories (source layout under dataset root) ──────────
     train_imgs = _find_images_dir(root, "train")
     val_imgs   = _find_images_dir(root, "val")
     test_imgs  = _find_images_dir(root, "test") or _find_images_dir(root, "test-dev")
@@ -280,30 +325,44 @@ def build_data_yaml(dataset_dir: str, output: str = "data.yaml") -> dict:
     assert train_imgs, f"Cannot find train images under {root}"
     assert val_imgs,   f"Cannot find val images under {root}"
 
-    # ── Convert COCO → YOLO labels for each split ─────────────────────────────
+    # ── Optional: single writable tree (images/, labels/, data.yaml) ──────────
+    yaml_root = root
+    if staging_dir:
+        yaml_root = Path(staging_dir).resolve()
+        yaml_root.mkdir(parents=True, exist_ok=True)
+        print(f"\n[prepare] staging dataset → {yaml_root}")
+        train_imgs = _stage_images_into(train_imgs, yaml_root, "train")
+        val_imgs   = _stage_images_into(val_imgs,   yaml_root, "val")
+        if test_imgs:
+            test_imgs = _stage_images_into(test_imgs, yaml_root, "test")
+
+    # ── Convert COCO → YOLO labels (JSON still read from original root) ─────
     _ensure_yolo_labels(root, "train", train_imgs)
     _ensure_yolo_labels(root, "val",   val_imgs)
     if test_imgs:
         _ensure_yolo_labels(root, "test", test_imgs)
 
-    # ── Write data.yaml ───────────────────────────────────────────────────────
+    # ── Write data.yaml (paths relative to yaml_root when possible) ───────────
     cfg: dict = {
-        "path" : str(root),
-        "train": str(train_imgs),
-        "val"  : str(val_imgs),
+        "path" : str(yaml_root),
+        "train": _rel_under_root(yaml_root, train_imgs),
+        "val"  : _rel_under_root(yaml_root, val_imgs),
         "nc"   : nc,
         "names": names,
     }
     if test_imgs:
-        cfg["test"] = str(test_imgs)
+        cfg["test"] = _rel_under_root(yaml_root, test_imgs)
 
-    Path(output).write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False))
-    print(f"\n[prepare] data.yaml → {output}")
+    out_path = Path(output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False))
+    print(f"\n[prepare] data.yaml → {out_path}")
     print(f"          nc={nc}  classes={names[:6]}{'...' if nc > 6 else ''}")
-    print(f"          train : {train_imgs}")
-    print(f"          val   : {val_imgs}")
+    print(f"          path  : {yaml_root}")
+    print(f"          train : {cfg['train']}")
+    print(f"          val   : {cfg['val']}")
     if test_imgs:
-        print(f"          test  : {test_imgs}")
+        print(f"          test  : {cfg['test']}")
     return cfg
 
 
@@ -396,11 +455,22 @@ def main():
     parser = argparse.ArgumentParser(description="AutoResearch-DET setup & eval")
     parser.add_argument("--dataset-dir", default=os.environ.get("DATASET_DIR", ""))
     parser.add_argument("--output",      default="data.yaml")
+    parser.add_argument(
+        "--staging-dir",
+        default=os.environ.get("PREPARE_STAGING_DIR", ""),
+        help="Writable folder: copies/links images + labels + data.yaml here (e.g. Kaggle /kaggle/working/prepared)",
+    )
     parser.add_argument("--eval",        action="store_true")
     parser.add_argument("--weights",     default="")
     parser.add_argument("--verify",      action="store_true",
                         help="Check dataset integrity only")
     args = parser.parse_args()
+
+    staging = (args.staging_dir or "").strip()
+    if staging:
+        out = Path(args.output)
+        if not out.is_absolute():
+            args.output = str(Path(staging) / out.name)
 
     if args.verify:
         ok = verify_dataset(args.output)
@@ -410,7 +480,11 @@ def main():
         evaluate(args.weights, args.output)
     else:
         assert args.dataset_dir, "Pass --dataset-dir or set DATASET_DIR"
-        build_data_yaml(args.dataset_dir, args.output)
+        build_data_yaml(
+            args.dataset_dir,
+            args.output,
+            staging_dir=staging or None,
+        )
 
 
 if __name__ == "__main__":
