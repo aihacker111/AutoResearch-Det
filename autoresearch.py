@@ -344,6 +344,8 @@ def propose_experiment(history: list[dict], current_code: str) -> dict:
                 '{"description": "one-line summary", "new_code": "<entire train.py as one JSON string>"}. '
                 "new_code MUST be valid JSON: escape every newline inside the string as \\n "
                 'and quotes as \\". Do NOT use Python triple quotes \"\"\" around new_code. '
+                "The train.py source must start with \"\"\" (docstring) as the very first characters; "
+                "use ASCII only in comments (no Unicode em-dashes). "
                 "No markdown fences, no text outside the JSON object."
             ),
         },
@@ -365,6 +367,12 @@ def propose_experiment(history: list[dict], current_code: str) -> dict:
 
 def _validate_train_py_source(src: str) -> None:
     """Reject LLM output that is not valid Python (prevents SyntaxError at train time)."""
+    s = src.lstrip("\ufeff \t\r\n")
+    if not (s.startswith('"""') or s.startswith("'''")):
+        raise ValueError(
+            'train.py must start with a triple-quoted docstring (""" on line 1). '
+            "LLM output may be truncated or missing the opening quotes."
+        )
     try:
         compile(src, str(_TRAIN_FILE), "exec")
     except SyntaxError as e:

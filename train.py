@@ -1,5 +1,5 @@
 """
-train.py — The ONLY file the agent is allowed to edit.
+train.py - The ONLY file the agent is allowed to edit.
 =======================================================
 AutoResearch-DET | YOLO11 fine-tuning on small datasets.
 
@@ -8,20 +8,20 @@ Backbone: YOLO11 (ultralytics)
 Task    : object detection, fine-tuning from COCO pretrained weights
 """
 
-# ── Model ─────────────────────────────────────────────────────────────────────
+# -- Model ---------------------------------------------------------------------
 MODEL_SIZE = "n"        # "n" | "s" | "m" | "l" | "x"
 PRETRAINED = True       # start from COCO pretrained weights
 
-# ── Dataset ───────────────────────────────────────────────────────────────────
+# -- Dataset -------------------------------------------------------------------
 DATA_YAML  = "data.yaml"
 
-# ── Training schedule ─────────────────────────────────────────────────────────
+# -- Training schedule ---------------------------------------------------------
 EPOCHS        = 1
-PATIENCE      = 15          # ↑ slightly more tolerance
+PATIENCE      = 15          # ^ slightly more tolerance
 IMGSZ         = 640
-CLOSE_MOSAIC  = 15          # ↑ disable mosaic earlier for small-data stability
+CLOSE_MOSAIC  = 15          # ^ disable mosaic earlier for small-data stability
 
-# ── Optimiser ─────────────────────────────────────────────────────────────────
+# -- Optimiser -----------------------------------------------------------------
 OPTIMIZER     = "AdamW"     # AdamW generally best for fine-tuning
 LR0           = 1e-3
 LRF           = 0.01        # cosine decay: final LR = LR0 * LRF
@@ -30,7 +30,7 @@ WEIGHT_DECAY  = 1e-4
 WARMUP_EPOCHS   = 3.0
 WARMUP_BIAS_LR  = 0.1
 
-# ── Augmentation ──────────────────────────────────────────────────────────────
+# -- Augmentation --------------------------------------------------------------
 HSV_H       = 0.015
 HSV_S       = 0.7
 HSV_V       = 0.4
@@ -45,18 +45,18 @@ MOSAIC      = 1.0
 MIXUP       = 0.0
 COPY_PASTE  = 0.0
 
-# ── Regularisation ────────────────────────────────────────────────────────────
+# -- Regularisation ------------------------------------------------------------
 DROPOUT         = 0.0
 LABEL_SMOOTHING = 0.0
 
-# ── Hardware ──────────────────────────────────────────────────────────────────
+# -- Hardware ------------------------------------------------------------------
 BATCH   = 16
 WORKERS = 4
 AMP     = True
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Do NOT edit below this line
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 import json, os, sys, time
 from pathlib import Path
 
