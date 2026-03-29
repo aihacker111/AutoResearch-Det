@@ -195,14 +195,29 @@ def _convert_coco_to_yolo(json_path: Path, labels_dir: Path) -> int:
 def _labels_dir_for(root: Path, split: str, images_dir: Path) -> Path:
     """
     Derive the labels directory path from the images directory.
-    - train/images/ → train/labels/
-    - images/train/ → labels/train/
-    - train/        → labels/train/   (VisDrone style)
+
+    If root is read-only (e.g. /kaggle/input), labels are redirected to
+    a writable sibling: /kaggle/working/labels/<dataset_name>/<split>
+    Otherwise:
+      - train/images/ → train/labels/
+      - images/train/ → labels/train/
+      - train/        → labels/train/  (VisDrone style)
     """
+    # ── Read-only root guard ──────────────────────────────────────────────────
+    try:
+        root.stat()
+        test_file = root / ".write_test"
+        test_file.touch()
+        test_file.unlink()
+    except (OSError, PermissionError):
+        # Root is read-only → write labels next to the working script
+        working_dir = Path(os.environ.get("LABELS_DIR", "labels"))
+        return working_dir / root.name / split
+
+    # ── Writable root: keep labels near images ────────────────────────────────
     img_str = str(images_dir)
     if "/images/" in img_str or img_str.endswith("/images"):
         return Path(img_str.replace("/images", "/labels", 1))
-    # images are directly in split folder → put labels under root/labels/split
     return root / "labels" / split
 
 
