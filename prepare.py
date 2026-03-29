@@ -136,38 +136,43 @@ def _find_annotation_json(root: Path, split: str) -> Path | None:
 def _convert_coco_to_yolo(json_path: Path, labels_dir: Path) -> int:
     """
     Convert COCO JSON to YOLO .txt label files.
-    Tries ultralytics built-in first, falls back to manual conversion.
+
+    Always uses manual conversion (NOT ultralytics built-in) because
+    ultralytics convert_coco computes class = category_id - 1, which
+    produces class -1 when any category has id=0 (e.g. VisDrone).
+
+    Safe mapping: sort categories by id, enumerate from 0 regardless
+    of original id values — guaranteed no negative class indices.
     Returns number of label files written.
     """
-    # ── Try ultralytics built-in ──────────────────────────────────────────────
-    try:
-        from ultralytics.data.converter import convert_coco
-        convert_coco(
-            labels_dir  = str(json_path.parent),
-            save_dir    = str(labels_dir.parent),
-            use_segments= False,
-            cls91to80   = False,
-        )
-        written = len(list(labels_dir.glob("*.txt"))) if labels_dir.exists() else 0
-        if written > 0:
-            return written
-    except Exception:
-        pass
+    data = json.loads(json_path.read_text())
 
-    # ── Manual fallback ───────────────────────────────────────────────────────
-    data    = json.loads(json_path.read_text())
-    cats    = sorted(data.get("categories", []), key=lambda c: int(c["id"]))
-    id2idx  = {c["id"]: i for i, c in enumerate(cats)}
-    id2meta = {img["id"]: img for img in data.get("images", [])}
+    # Safe 0-based index: sort by original id, enumerate from 0
+    cats   = sorted(data.get("categories", []), key=lambda c: int(c["id"]))
+    id2idx = {c["id"]: i for i, c in enumerate(cats)}
+
+    print(f"          categories ({len(cats)}): "
+          + ", ".join(f"{c['id']}->{id2idx[c['id']]}:{c['name']}" for c in cats[:6])
+          + ("..." if len(cats) > 6 else ""))
+
+    id2meta: dict = {img["id"]: img for img in data.get("images", [])}
 
     anns_by_image: dict = defaultdict(list)
+    skipped_crowd = skipped_cat = 0
     for ann in data.get("annotations", []):
         if ann.get("iscrowd", 0):
+            skipped_crowd += 1
+            continue
+        if ann["category_id"] not in id2idx:
+            skipped_cat += 1
             continue
         anns_by_image[ann["image_id"]].append(ann)
 
+    if skipped_crowd: print(f"          skipped {skipped_crowd} crowd annotations")
+    if skipped_cat:   print(f"          skipped {skipped_cat} unknown category_id")
+
     labels_dir.mkdir(parents=True, exist_ok=True)
-    written = 0
+    written = skipped_bbox = 0
     for img_id, anns in anns_by_image.items():
         meta = id2meta.get(img_id)
         if not meta:
@@ -178,19 +183,20 @@ def _convert_coco_to_yolo(json_path: Path, labels_dir: Path) -> int:
         for ann in anns:
             x, y, w, h = ann["bbox"]
             if w <= 0 or h <= 0:
+                skipped_bbox += 1
                 continue
-            cx  = (x + w / 2) / W
-            cy  = (y + h / 2) / H
-            nw  = w / W
-            nh  = h / H
-            cls = id2idx.get(ann["category_id"], 0)
+            cx  = max(0.0, min(1.0, (x + w / 2) / W))
+            cy  = max(0.0, min(1.0, (y + h / 2) / H))
+            nw  = max(0.0, min(1.0, w / W))
+            nh  = max(0.0, min(1.0, h / H))
+            cls = id2idx[ann["category_id"]]  # guaranteed >= 0
             lines.append(f"{cls} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
         if lines:
             (labels_dir / f"{stem}.txt").write_text("\n".join(lines))
             written += 1
 
+    if skipped_bbox: print(f"          skipped {skipped_bbox} zero-size bboxes")
     return written
-
 
 def _labels_dir_for(root: Path, split: str, images_dir: Path) -> Path:
     """
