@@ -39,9 +39,12 @@ from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
 _DEFAULT_MODEL  = "openrouter/meta-llama/llama-3.3-70b-instruct:free"
-_TRAIN_FILE     = "train.py"
-_RESULTS_FILE   = "results.tsv"
-_LOG_FILE       = "run.log"
+_ROOT           = Path(__file__).resolve().parent
+_TRAIN_FILE     = _ROOT / "train.py"
+_RESULTS_FILE   = _ROOT / "results.tsv"
+_LOG_FILE       = _ROOT / "run.log"
+# Git paths are relative to repo root (= _ROOT when layout is standard)
+_GIT_TRAIN_PATH = "train.py"
 _TIMEOUT_FACTOR = 2.5
 _LLM_RETRIES    = 3
 _LLM_RETRY_WAIT = 5   # seconds between retries
@@ -77,13 +80,14 @@ def detect_gpus() -> int:
 
 
 def build_cmd(num_gpus: int) -> list[str]:
+    train = str(_TRAIN_FILE)
     if num_gpus <= 1:
-        return [sys.executable, _TRAIN_FILE]
+        return [sys.executable, train]
     return [
         sys.executable, "-m", "torch.distributed.run",
         f"--nproc_per_node={num_gpus}",
         "--master_port=29500",
-        _TRAIN_FILE,
+        train,
     ]
 
 
@@ -178,26 +182,35 @@ def propose_experiment(history: list[dict], current_code: str) -> dict:
 
 def git_is_clean() -> bool:
     r = subprocess.run(
-        ["git", "status", "--porcelain", _TRAIN_FILE],
+        ["git", "-C", str(_ROOT), "status", "--porcelain", _GIT_TRAIN_PATH],
         capture_output=True, text=True,
     )
     return r.stdout.strip() == ""
 
 
 def git_commit(msg: str) -> str:
-    subprocess.run(["git", "add", _TRAIN_FILE], capture_output=True)
-    r = subprocess.run(["git", "commit", "-m", msg], capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(_ROOT), "add", _GIT_TRAIN_PATH],
+        capture_output=True,
+    )
+    r = subprocess.run(
+        ["git", "-C", str(_ROOT), "commit", "-m", msg],
+        capture_output=True,
+    )
     if r.returncode != 0 and b"nothing to commit" in r.stdout + r.stderr:
         # Nothing changed (e.g. baseline); return current HEAD
         pass
     return subprocess.check_output(
-        ["git", "rev-parse", "--short", "HEAD"], text=True
+        ["git", "-C", str(_ROOT), "rev-parse", "--short", "HEAD"], text=True
     ).strip()
 
 
 def git_reset_last() -> None:
     """Discard the last commit (experiment that didn't improve)."""
-    subprocess.run(["git", "reset", "--hard", "HEAD~1"], capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(_ROOT), "reset", "--hard", "HEAD~1"],
+        capture_output=True,
+    )
 
 
 # ── Training & metrics ────────────────────────────────────────────────────────
@@ -208,6 +221,7 @@ def run_training(num_gpus: int, timeout: float | None) -> tuple[bool, float]:
     try:
         proc = subprocess.run(
             cmd,
+            cwd     = str(_ROOT),
             stdout  = open(_LOG_FILE, "w"),
             stderr  = subprocess.STDOUT,
             timeout = timeout,
@@ -277,8 +291,13 @@ def append_result(commit: str, metrics: dict, status: str, description: str) -> 
 # ── Progress plot ─────────────────────────────────────────────────────────────
 
 def update_plot() -> None:
-    if Path("plot_progress.py").exists():
-        subprocess.run([sys.executable, "plot_progress.py"], capture_output=True)
+    plot = _ROOT / "plot_progress.py"
+    if plot.exists():
+        subprocess.run(
+            [sys.executable, str(plot)],
+            cwd=str(_ROOT),
+            capture_output=True,
+        )
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -317,9 +336,21 @@ def main() -> None:
     # ── Git branch ----------------------------------------------------------
     tag    = datetime.now().strftime("%b%d").lower()
     branch = f"autoresearch/{tag}"
-    r = subprocess.run(["git", "checkout", "-b", branch], capture_output=True)
+    r = subprocess.run(
+        ["git", "-C", str(_ROOT), "checkout", "-b", branch],
+        capture_output=True,
+    )
     if r.returncode != 0:
-        subprocess.run(["git", "checkout", branch], capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(_ROOT), "checkout", branch],
+            capture_output=True,
+        )
+
+    if not _TRAIN_FILE.is_file():
+        sys.exit(
+            f"ERROR: {_TRAIN_FILE} not found. Add train.py next to autoresearch.py "
+            "(or clone the full AutoResearch-Det repo)."
+        )
 
     _ensure_results_file()
 
