@@ -52,6 +52,11 @@ _LLM_RETRIES    = 3
 _LLM_RETRY_WAIT = 5    # seconds between retries
 _LLM_MAX_TOKENS = 6000
 
+# Parameters that must never be changed by the LLM -- changing these would
+# make experiment comparisons unfair (different training budget / hardware
+# settings / numerical precision).
+_FIXED_PARAMS = ("EPOCHS", "IMGSZ", "BATCH", "WORKERS", "AMP")
+
 # Runtime globals
 OPENROUTER_API_KEY: str = ""
 LLM_MODEL:          str = _DEFAULT_MODEL
@@ -124,7 +129,13 @@ def _call_api(messages: list[dict], max_tokens: int = _LLM_MAX_TOKENS) -> str:
         },
     )
     with urllib.request.urlopen(req, timeout=90) as r:
-        return json.loads(r.read())["choices"][0]["message"]["content"].strip()
+        body    = json.loads(r.read())
+        content = body["choices"][0]["message"].get("content")
+        if not content:
+            # Surface finish_reason (e.g. "length", "content_filter") if present
+            reason = body["choices"][0].get("finish_reason", "unknown")
+            raise ValueError(f"API returned empty content (finish_reason={reason!r})")
+        return content.strip()
 
 
 def _call_api_with_retry(messages: list[dict], max_tokens: int = _LLM_MAX_TOKENS) -> str:
@@ -132,7 +143,8 @@ def _call_api_with_retry(messages: list[dict], max_tokens: int = _LLM_MAX_TOKENS
     for attempt in range(1, _LLM_RETRIES + 1):
         try:
             return _call_api(messages, max_tokens)
-        except (urllib.error.URLError, KeyError, json.JSONDecodeError) as e:
+        except (urllib.error.URLError, KeyError, json.JSONDecodeError,
+                AttributeError, ValueError) as e:
             last_exc = e
             if attempt < _LLM_RETRIES:
                 print(f"  [LLM] attempt {attempt} failed ({e}), retrying in {_LLM_RETRY_WAIT}s...")
@@ -214,15 +226,15 @@ def _looks_like_train_py(s: str) -> bool:
     if not has_python:
         return False
     return (
-        "MODEL_SIZE"     in s
-        or "EPOCHS"      in s
-        or "LR0"         in s
-        or "BATCH"       in s
-        or "ultralytics" in s
-        or "YOLO"        in s
+        "MODEL_SIZE"      in s
+        or "EPOCHS"       in s
+        or "LR0"          in s
+        or "BATCH"        in s
+        or "ultralytics"  in s
+        or "YOLO"         in s
         or "model.train(" in s
-        or "train.py"   in s
-        or ("def main"  in s and ("train" in s.lower() or "yolo" in s.lower()))
+        or "train.py"     in s
+        or ("def main"    in s and ("train" in s.lower() or "yolo" in s.lower()))
     )
 
 
@@ -538,6 +550,7 @@ def propose_experiment(history: list[dict], current_code: str) -> dict:
     ) or "  (none yet -- this will be the baseline)"
 
     code_chars = len(current_code)
+    fixed_str  = ", ".join(_FIXED_PARAMS)
 
     system_prompt = (
         "You are an expert computer vision researcher optimising YOLO11 "
@@ -563,14 +576,18 @@ def propose_experiment(history: list[dict], current_code: str) -> dict:
         "(above the '# Do NOT edit below this line' comment)\n"
         "  - Keep ALL function bodies, imports, and boilerplate byte-for-byte identical\n"
         f"  - Current file is {code_chars} characters; new_code must be similar in size\n"
+        f"  - Do NOT change {fixed_str} -- these are fixed across ALL experiments\n"
+        "    to ensure fair comparison (same training budget, input resolution,\n"
+        "    hardware settings, and numerical precision)\n"
     )
 
     user_prompt = (
         f"Experiment history:\n{history_block}\n\n"
         f"Current train.py ({code_chars} chars):\n{current_code}\n\n"
         "Pick ONE change most likely to improve val/mAP50-95 for small-data fine-tuning.\n"
-        "Good candidates: EPOCHS, LR0, LRF, OPTIMIZER, WARMUP_EPOCHS, WEIGHT_DECAY, "
-        "DROPOUT, LABEL_SMOOTHING, MOSAIC, MIXUP, CLOSE_MOSAIC, IMGSZ, BATCH, MODEL_SIZE.\n"
+        "Good candidates: LR0, LRF, OPTIMIZER, MOMENTUM, WEIGHT_DECAY, "
+        "WARMUP_EPOCHS, WARMUP_BIAS_LR, DROPOUT, LABEL_SMOOTHING, "
+        "MOSAIC, MIXUP, COPY_PASTE, CLOSE_MOSAIC, PATIENCE, MODEL_SIZE.\n"
         "Return the COMPLETE modified train.py as new_code."
     )
 
@@ -584,6 +601,7 @@ def propose_experiment(history: list[dict], current_code: str) -> dict:
 # ── Validation ────────────────────────────────────────────────────────────────
 
 def _validate_train_py_source(src: str) -> None:
+    """Reject LLM output that is not syntactically valid Python."""
     s = src.lstrip("\ufeff \t\r\n")
     if not (s.startswith('"""') or s.startswith("'''")):
         raise ValueError(
@@ -603,6 +621,23 @@ def _validate_train_py_source(src: str) -> None:
         raise ValueError(
             f"SyntaxError on line {e.lineno}: {e.msg}\n{ctx}"
         ) from e
+
+
+def _validate_fixed_params(new_src: str, original_src: str) -> None:
+    """
+    Ensure the LLM did not touch any of the fixed parameters defined in
+    _FIXED_PARAMS.  These must stay identical across all experiments so that
+    results are directly comparable (same training budget, resolution, hardware
+    settings, and numerical precision).
+    """
+    for param in _FIXED_PARAMS:
+        orig_m = re.search(rf"^{param}\s*=\s*(.+)$", original_src, re.MULTILINE)
+        new_m  = re.search(rf"^{param}\s*=\s*(.+)$", new_src,      re.MULTILINE)
+        if orig_m and new_m and orig_m.group(1).strip() != new_m.group(1).strip():
+            raise ValueError(
+                f"LLM changed fixed param {param}: "
+                f"{orig_m.group(1).strip()!r} -> {new_m.group(1).strip()!r}"
+            )
 
 
 # ── Git helpers ───────────────────────────────────────────────────────────────
@@ -643,12 +678,10 @@ def git_reset_last() -> None:
 
 # Matches a YOLO/rich per-batch progress line, e.g.:
 #   "  1/1  3.8G  1.948 ...  78% ━━━━━─── 316/405 4.7it/s 1:24<19.3s"
-# Heuristic: line contains rich block characters OR the "NNN/MMM 4.7it/s"
-# step counter that appears on every batch update.
 _PROGRESS_RE = re.compile(
-    r"(?:[\u2501\u2578\u2579\u257a\u257b\u254b\u2503\u2500\u2580\u2584\u2588]"  # rich bar chars
-    r"|\b\d+/\d+\s+\d+\.\d+it/s"    # e.g. 316/405  4.7it/s
-    r"|\d+%\s*[|\u2500-\u259f])",    # e.g. 78% ━
+    r"(?:[\u2501\u2578\u2579\u257a\u257b\u254b\u2503\u2500\u2580\u2584\u2588]"
+    r"|\b\d+/\d+\s+\d+\.\d+it/s"
+    r"|\d+%\s*[|\u2500-\u259f])",
 )
 
 # Width used to pad/clear the overwritten progress line
@@ -679,8 +712,8 @@ def _stream_process(
     Every line -- including progress noise -- is still written to run.log.
     """
     t0 = time.time()
-    timed_out     = False
-    on_prog_line  = False   # True when the last terminal write used \\r
+    timed_out    = False
+    on_prog_line = False   # True when the last terminal write used \\r
 
     def _watchdog():
         nonlocal timed_out
@@ -918,6 +951,7 @@ def main() -> None:
     print(f"  LLM model   : {LLM_MODEL}")
     print(f"  GPUs        : {NUM_GPUS}  ->  {cmd_str}")
     print(f"  Experiments : {args.experiments - completed} remaining / {args.experiments} total")
+    print(f"  Fixed params: {', '.join(_FIXED_PARAMS)}")
     if args.dry_run:
         print(f"  Mode        : DRY-RUN (no training)")
     if args.quiet:
@@ -946,6 +980,7 @@ def main() -> None:
                 if not args.dry_run:
                     clean_code = _sanitize_train_py(proposal["new_code"])
                     _validate_train_py_source(clean_code)
+                    _validate_fixed_params(clean_code, current_code)
                     Path(_TRAIN_FILE).write_text(clean_code, encoding="utf-8")
                 print(f"  Idea  : {description}")
             except Exception as exc:
