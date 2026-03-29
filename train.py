@@ -50,7 +50,7 @@ DROPOUT         = 0.0
 LABEL_SMOOTHING = 0.0
 
 # -- Hardware ------------------------------------------------------------------
-BATCH   = 64
+BATCH   = 32
 WORKERS = 8
 AMP     = True
 
