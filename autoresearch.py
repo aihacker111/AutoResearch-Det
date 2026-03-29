@@ -363,6 +363,16 @@ def propose_experiment(history: list[dict], current_code: str) -> dict:
     return _parse_llm_proposal(_call_api_with_retry(messages))
 
 
+def _validate_train_py_source(src: str) -> None:
+    """Reject LLM output that is not valid Python (prevents SyntaxError at train time)."""
+    try:
+        compile(src, str(_TRAIN_FILE), "exec")
+    except SyntaxError as e:
+        raise ValueError(
+            f"train.py from LLM has a syntax error (line {e.lineno}): {e.msg}"
+        ) from e
+
+
 # ── Git helpers ───────────────────────────────────────────────────────────────
 
 def git_is_clean() -> bool:
@@ -692,6 +702,7 @@ def main() -> None:
                 proposal    = propose_experiment(history, current_code)
                 description = proposal["description"]
                 if not args.dry_run:
+                    _validate_train_py_source(proposal["new_code"])
                     Path(_TRAIN_FILE).write_text(proposal["new_code"])
                 print(f"  Idea  : {description}")
             except Exception as exc:
