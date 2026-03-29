@@ -79,7 +79,6 @@ def _load_yolo(weights_arg: str):
 
     root = Path(__file__).resolve().parent
     lock_path = root / ".ultralytics_yolo_init.lock"
-    # Path.open(mode=...) avoids broken "a+\ line continuations from bad edits
     lock_f = lock_path.open(mode="a+", encoding="utf-8")
     try:
         if sys.platform != "win32":
