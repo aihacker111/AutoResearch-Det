@@ -17,9 +17,10 @@ Usage
 
 Environment variables
 ---------------------
-    OPENROUTER_API_KEY   API key for OpenRouter
-    DATASET_DIR          Path to dataset root
-    OUTPUT_DIR           Base output directory (default: output/train)
+    OPENROUTER_API_KEY      API key for OpenRouter
+    DATASET_DIR             Path to dataset root
+    OUTPUT_DIR              Base output directory (default: output/train)
+    AUTORESEARCH_PLOT_DIR   Where plot_progress writes progress.png (default: project root)
 """
 
 from __future__ import annotations
@@ -875,14 +876,40 @@ def append_result(commit: str, metrics: dict, status: str, description: str) -> 
 
 # ── Progress plot ─────────────────────────────────────────────────────────────
 
+def _plot_output_dir() -> Path:
+    """Directory for progress.png / progress_detail.png (see plot_progress.py -o)."""
+    p = Path(os.environ.get("AUTORESEARCH_PLOT_DIR", str(_ROOT))).expanduser().resolve()
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def update_plot() -> None:
-    plot = _ROOT / "plot_progress.py"
-    if plot.exists():
-        subprocess.run(
-            [sys.executable, str(plot)],
-            cwd=str(_ROOT),
-            capture_output=True,
+    """Regenerate charts via plot_progress.py after each experiment (same CLI as manual run)."""
+    script = _ROOT / "plot_progress.py"
+    if not script.is_file():
+        return
+    out_dir = _plot_output_dir()
+    r = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "-i",
+            str(_RESULTS_FILE),
+            "-o",
+            str(out_dir),
+        ],
+        cwd=str(_ROOT),
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        print(
+            f"  [plot] warning: plot_progress.py exited {r.returncode} "
+            f"(see stderr below)"
         )
+        err = (r.stderr or "").strip()
+        if err:
+            print(err[:800])
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -1054,6 +1081,9 @@ def main() -> None:
     print(f"  Improvement  : {delta:+.4f}  ({pct:+.1f}%)")
     print(f"  Best config  : {best['description']}")
     print(f"  Results      : {_RESULTS_FILE}")
+    plot_png = _plot_output_dir() / "progress.png"
+    if plot_png.is_file():
+        print(f"  Progress plot: {plot_png}")
     print(f"{'='*62}\n")
 
 
