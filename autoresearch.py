@@ -301,7 +301,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # ── Environment ----------------------------------------------------------
-    OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+    OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "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")
     if not OPENROUTER_API_KEY:
         sys.exit("ERROR: set OPENROUTER_API_KEY environment variable")
 
