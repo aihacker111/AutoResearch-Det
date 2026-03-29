@@ -56,7 +56,7 @@ _LLM_MAX_TOKENS = 6000
 # Parameters that must never be changed by the LLM -- changing these would
 # make experiment comparisons unfair (different training budget / hardware
 # settings / numerical precision).
-_FIXED_PARAMS = ("EPOCHS", "IMGSZ", "BATCH", "WORKERS", "AMP")
+_FIXED_PARAMS = ("MODEL_SIZE", "PRETRAINED", "EPOCHS", "IMGSZ", "BATCH", "WORKERS", "AMP")
 
 # Runtime globals
 OPENROUTER_API_KEY: str = ""
