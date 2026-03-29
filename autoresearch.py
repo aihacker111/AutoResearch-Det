@@ -1,11 +1,11 @@
 """
-run_autoresearch.py — Autonomous hyperparameter research loop.
+run_autoresearch.py -- Autonomous hyperparameter research loop.
 ==============================================================
 AutoResearch-DET | Object Detection with YOLO11
 
 The agent (LLM) proposes ONE hyperparameter change per iteration.
 This runner executes the experiment, records the result, and keeps
-or discards the change — completely autonomously.
+or discards the change -- completely autonomously.
 
 Usage
 -----
@@ -25,10 +25,10 @@ Environment variables
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import re
-import shlex
 import signal
 import subprocess
 import sys
@@ -46,27 +46,39 @@ _ROOT           = Path(__file__).resolve().parent
 _TRAIN_FILE     = _ROOT / "train.py"
 _RESULTS_FILE   = _ROOT / "results.tsv"
 _LOG_FILE       = _ROOT / "run.log"
-# Git paths are relative to repo root (= _ROOT when layout is standard)
 _GIT_TRAIN_PATH = "train.py"
 _TIMEOUT_FACTOR = 2.5
 _LLM_RETRIES    = 3
-_LLM_RETRY_WAIT = 5   # seconds between retries
+_LLM_RETRY_WAIT = 5    # seconds between retries
+# FIX #1: was 3000 -- train.py JSON-encoded is ~2k tokens; leave headroom for expansion
+_LLM_MAX_TOKENS = 6000
 
 # Runtime globals
 OPENROUTER_API_KEY: str = ""
 LLM_MODEL:          str = _DEFAULT_MODEL
 NUM_GPUS:           int = 2
-_shutdown_requested:bool = False
+_shutdown_requested: bool = False
 
 
 # ── Graceful Ctrl-C ───────────────────────────────────────────────────────────
 
 def _handle_sigint(sig, frame):
     global _shutdown_requested
-    print("\n[!] Interrupt received — finishing current experiment then stopping.")
+    print("\n[!] Interrupt received -- finishing current experiment then stopping.")
     _shutdown_requested = True
 
 signal.signal(signal.SIGINT, _handle_sigint)
+
+
+# ── Stdout helpers ────────────────────────────────────────────────────────────
+
+def _force_unbuffered_stdout() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(line_buffering=True)
+            except (OSError, ValueError, io.UnsupportedOperation):
+                pass
 
 
 # ── GPU detection ─────────────────────────────────────────────────────────────
@@ -96,9 +108,9 @@ def build_cmd(num_gpus: int) -> list[str]:
     ]
 
 
-# ── LLM interaction ───────────────────────────────────────────────────────────
+# ── LLM API ───────────────────────────────────────────────────────────────────
 
-def _call_api(messages: list[dict], max_tokens: int = 3000) -> str:
+def _call_api(messages: list[dict], max_tokens: int = _LLM_MAX_TOKENS) -> str:
     payload = json.dumps({
         "model"     : LLM_MODEL,
         "max_tokens": max_tokens,
@@ -116,7 +128,7 @@ def _call_api(messages: list[dict], max_tokens: int = 3000) -> str:
         return json.loads(r.read())["choices"][0]["message"]["content"].strip()
 
 
-def _call_api_with_retry(messages: list[dict], max_tokens: int = 3000) -> str:
+def _call_api_with_retry(messages: list[dict], max_tokens: int = _LLM_MAX_TOKENS) -> str:
     last_exc: Exception | None = None
     for attempt in range(1, _LLM_RETRIES + 1):
         try:
@@ -124,47 +136,164 @@ def _call_api_with_retry(messages: list[dict], max_tokens: int = 3000) -> str:
         except (urllib.error.URLError, KeyError, json.JSONDecodeError) as e:
             last_exc = e
             if attempt < _LLM_RETRIES:
-                print(f"  [LLM] attempt {attempt} failed ({e}), retrying in {_LLM_RETRY_WAIT}s…")
+                print(f"  [LLM] attempt {attempt} failed ({e}), retrying in {_LLM_RETRY_WAIT}s...")
                 time.sleep(_LLM_RETRY_WAIT * attempt)
     raise RuntimeError(f"LLM API failed after {_LLM_RETRIES} attempts: {last_exc}")
 
 
+# ── Unicode / encoding helpers ────────────────────────────────────────────────
+
+# FIX #8: comprehensive table -- old version only had 4 entries and missed
+# CRLF, zero-width chars, non-breaking space, BOM, and many quote variants.
+_UNICODE_REPLACEMENTS: tuple[tuple[str, str], ...] = (
+    # Quotation marks (all variants LLMs emit)
+    ("\u2018", "'"),   # left single quotation mark
+    ("\u2019", "'"),   # right single quotation mark  <-- most common culprit
+    ("\u201a", "'"),   # single low-9 quotation mark
+    ("\u201b", "'"),   # single high-reversed-9 quotation mark
+    ("\u201c", '"'),   # left double quotation mark
+    ("\u201d", '"'),   # right double quotation mark
+    ("\u201e", '"'),   # double low-9 quotation mark
+    ("\u201f", '"'),   # double high-reversed-9 quotation mark
+    ("\u2032", "'"),   # prime
+    ("\u2033", '"'),   # double prime
+    # Dashes
+    ("\u2014", "-"),   # em dash
+    ("\u2013", "-"),   # en dash
+    ("\u2012", "-"),   # figure dash
+    ("\u2015", "-"),   # horizontal bar
+    # Ellipsis
+    ("\u2026", "..."), # horizontal ellipsis
+    # Spaces / invisible characters
+    ("\u00a0", " "),   # non-breaking space
+    ("\u200b", ""),    # zero-width space
+    ("\u200c", ""),    # zero-width non-joiner
+    ("\u200d", ""),    # zero-width joiner
+    ("\u2060", ""),    # word joiner
+    ("\ufeff", ""),    # BOM / zero-width no-break space
+    # Misc
+    ("\u00b4", "'"),   # acute accent used as apostrophe
+)
+
+
 def _normalize_llm_text(text: str) -> str:
+    """Strip BOM, replace typographic Unicode, re-encode as clean UTF-8."""
     t = text.strip()
-    if t.startswith("\ufeff"):
-        t = t[1:]
-    for a, b in (
-        ("\u201c", '"'),
-        ("\u201d", '"'),
-        ("\u2018", "'"),
-        ("\u2019", "'"),
-    ):
-        t = t.replace(a, b)
+    for bad, good in _UNICODE_REPLACEMENTS:
+        t = t.replace(bad, good)
     return t.encode("utf-8", errors="replace").decode("utf-8")
 
 
+def _sanitize_train_py(src: str) -> str:
+    """
+    Full sanitization of LLM-generated train.py before writing to disk.
+    FIX #8: added CRLF->LF, zero-width chars, non-breaking space, BOM,
+    and 14 additional Unicode quote/dash variants.
+    """
+    for bad, good in _UNICODE_REPLACEMENTS:
+        src = src.replace(bad, good)
+    # Windows -> Unix line endings
+    src = src.replace("\r\n", "\n").replace("\r", "\n")
+    # Trailing whitespace on each line (cosmetic, avoids diff noise)
+    src = "\n".join(line.rstrip() for line in src.splitlines())
+    # Ensure exactly one trailing newline
+    return src.rstrip("\n") + "\n"
+
+
+# ── LLM output parsing ────────────────────────────────────────────────────────
+#
+# Ten-stage waterfall. Each parser returns {"description": str, "new_code": str}
+# or None. The master dispatcher (_parse_llm_proposal) stops at first success.
+#
+# Stage  Parser                       Handles
+# -----  ---------------------------  ----------------------------------------
+#   1    _try_json_raw_decode         Valid JSON, possibly with prose before it
+#   2    _try_json_loads_whole        Clean JSON response
+#   3    _fix_json_literal_newlines   Most common mistake: \n not escaped as \\n
+#        -> retry stages 1-2
+#   4    _try_fenced_json_inner       ```json {...} ``` (inner retried 1-3)
+#   5    _try_triple_quote_new_code   "new_code": """..."""  (GREEDY -- fixed)
+#   6    _try_regex_quoted_fields     Proper \" escaping but otherwise bad JSON
+#   7    _try_greedy_new_code_extract Unescaped " inside new_code value
+#   8    _try_markdown_code_blocks    Any fenced code block (any label)
+#   9    _try_plain_train_py          Raw train.py with no JSON wrapper at all
+
+
 def _strip_outer_markdown_fence(text: str) -> str:
-    """If the whole reply is one ```json / ```python block, return inner text."""
+    """If the entire reply is wrapped in one code fence, unwrap it."""
     t = text.strip()
-    m = re.match(r"^```(?:json|python|py)?\s*\r?\n(.*)\r?\n```\s*$", t, re.DOTALL | re.IGNORECASE)
+    m = re.match(r"^```\S*\s*\r?\n(.*)\r?\n```\s*$", t, re.DOTALL)
     return m.group(1).strip() if m else t
 
 
 def _looks_like_train_py(s: str) -> bool:
-    if not s or len(s.strip()) < 80:
+    """
+    Returns True if s looks like a YOLO11 train.py source file.
+    FIX #7: old version had only 5 signals and was too strict.
+    Now uses 9 signals covering any reasonable refactoring.
+    The compile() call in _validate_train_py_source is the hard gate;
+    this check is intentionally permissive.
+    """
+    if not s or len(s.strip()) < 200:
         return False
-    head = s[:4000]
+    # Require at least minimal Python structure
+    has_python = (
+        "\ndef " in s or s.startswith("def ")
+        or '"""' in s or "'''" in s
+        or "import " in s
+    )
+    if not has_python:
+        return False
     return (
-        "train.py" in head
-        or "MODEL_SIZE" in head
-        or ("def main" in s and "YOLO" in s)
-        or "ultralytics" in head
-        or ("model.train(" in s and "EPOCHS" in head)
+        "MODEL_SIZE"     in s
+        or "EPOCHS"      in s
+        or "LR0"         in s
+        or "BATCH"       in s
+        or "ultralytics" in s
+        or "YOLO"        in s
+        or "model.train(" in s
+        or "train.py"   in s
+        or ("def main"  in s and ("train" in s.lower() or "yolo" in s.lower()))
     )
 
 
+def _unescape_json_string(s: str) -> str:
+    """
+    Decode a JSON string body (no surrounding quotes).
+    Falls back to manual substitution so callers always get a usable string.
+    """
+    try:
+        return json.loads('"' + s + '"')
+    except (json.JSONDecodeError, ValueError):
+        return (
+            s.replace("\\n", "\n")
+             .replace("\\t", "\t")
+             .replace('\\"', '"')
+             .replace("\\\\", "\\")
+        )
+
+
+def _smart_decode_code(raw: str) -> str:
+    """
+    Decide whether raw is JSON-escaped (\\n sequences) or literal (real newlines)
+    and decode accordingly, handling mixed content.
+    """
+    if "\n" in raw:
+        # Already has real newlines -- only decode explicit escape sequences,
+        # not \\n (that would double-decode)
+        return (
+            raw.replace("\\t", "\t")
+               .replace('\\"', '"')
+               .replace("\\\\", "\\")
+        )
+    # No real newlines present -- assume fully JSON-escaped
+    return _unescape_json_string(raw)
+
+
+# -- Stage 1 ------------------------------------------------------------------
+
 def _try_json_raw_decode(text: str) -> dict | None:
-    """Parse first JSON object in text (ignores prose before/after)."""
+    """Parse first JSON object found (ignores any prose before the {)."""
     i = text.find("{")
     if i < 0:
         return None
@@ -181,7 +310,10 @@ def _try_json_raw_decode(text: str) -> dict | None:
     return {"description": str(desc).strip(), "new_code": str(nc)}
 
 
+# -- Stage 2 ------------------------------------------------------------------
+
 def _try_json_loads_whole(text: str) -> dict | None:
+    """Parse entire text as JSON."""
     try:
         obj = json.loads(text)
     except (json.JSONDecodeError, TypeError):
@@ -195,189 +327,392 @@ def _try_json_loads_whole(text: str) -> dict | None:
     return {"description": str(desc).strip(), "new_code": str(nc)}
 
 
-def _try_triple_quote_new_code(text: str) -> dict | None:
-    tri = re.search(r'"new_code"\s*:\s*"""(.*?)"""', text, re.DOTALL)
-    if not tri:
+# -- Stage 3 pre-processor ----------------------------------------------------
+
+def _fix_json_literal_newlines(text: str) -> str:
+    """
+    FIX #2 (new): most common LLM mistake -- returning JSON where the new_code
+    value contains literal newline characters instead of the two-char escape \\n.
+
+    Scans only the new_code string value region and escapes bare newlines so
+    standard JSON parsers can then succeed.  Returns text unchanged if the
+    structure can't be found.
+    """
+    start_m = re.search(r'"new_code"\s*:\s*"', text)
+    if not start_m:
+        return text
+
+    prefix = text[: start_m.end()]
+    rest   = text[start_m.end():]
+
+    fixed: list[str] = []
+    i = 0
+    closed = False
+
+    while i < len(rest):
+        c = rest[i]
+        if c == "\\" and i + 1 < len(rest):
+            # Already an escape sequence -- copy verbatim
+            fixed.append(rest[i : i + 2])
+            i += 2
+        elif c == '"':
+            # Closing quote of the JSON string value
+            fixed.append('"')
+            i += 1
+            closed = True
+            break
+        elif c == "\r" and i + 1 < len(rest) and rest[i + 1] == "\n":
+            fixed.append("\\n")   # CRLF -> \n escape
+            i += 2
+        elif c in ("\n", "\r"):
+            fixed.append("\\n")   # bare newline -> \n escape
+            i += 1
+        else:
+            fixed.append(c)
+            i += 1
+
+    if not closed:
+        return text  # could not find closing quote; bail out unchanged
+
+    return prefix + "".join(fixed) + rest[i:]
+
+
+# -- Stage 4 ------------------------------------------------------------------
+
+def _try_fenced_json_inner(text: str) -> dict | None:
+    """
+    Extract a ```json ... ``` block and run stages 1-3 on its inner content.
+    FIX #5: old version only tried two parsers; now tries all JSON parsers
+    including the literal-newline pre-processor.
+    """
+    m = re.search(r"```(?:json)?\s*\r?\n(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if not m:
         return None
-    new_code = tri.group(1).strip()
-    desc_m = re.search(r'"description"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
-    if not desc_m:
-        desc_m = re.search(r'"description"\s*:\s*"([^"]*)"', text)
-    if not desc_m:
-        return {"description": "LLM proposal (triple-quoted new_code)", "new_code": new_code}
-    desc = desc_m.group(1).replace("\\n", "\n").replace('\\"', '"')
+    inner = m.group(1).strip()
+
+    for fn in (_try_json_raw_decode, _try_json_loads_whole):
+        out = fn(inner)
+        if out:
+            return out
+
+    fixed = _fix_json_literal_newlines(inner)
+    if fixed != inner:
+        for fn in (_try_json_raw_decode, _try_json_loads_whole):
+            out = fn(fixed)
+            if out:
+                return out
+
+    return (
+        _try_triple_quote_new_code(inner)
+        or _try_regex_quoted_fields(inner)
+        or _try_greedy_new_code_extract(inner)
+    )
+
+
+# -- Stage 5 ------------------------------------------------------------------
+
+def _try_triple_quote_new_code(text: str) -> dict | None:
+    """
+    Handle: "new_code": \"\"\"...full file...\"\"\".
+
+    FIX #3 (critical): old non-greedy (.*?) stopped at the FIRST \"\"\" inside
+    the code, which is always the file-level docstring -- giving truncated code.
+
+    Fix: collect ALL \"\"\" positions after the opening, then pick the LAST one
+    that is followed by a JSON-closing character (} , or end-of-text).
+    """
+    start_m = re.search(r'"new_code"\s*:\s*"""', text, re.DOTALL)
+    if not start_m:
+        return None
+
+    after_open = text[start_m.end():]
+    triple_positions = [m.start() for m in re.finditer(r'"""', after_open)]
+    if not triple_positions:
+        return None
+
+    new_code: str | None = None
+
+    # Prefer the LAST """ followed by JSON-closing pattern
+    for pos in reversed(triple_positions):
+        candidate = after_open[:pos]
+        tail = after_open[pos + 3:].lstrip()
+        if not tail or tail[0] in ("}", ",", "\n"):
+            new_code = candidate
+            break
+
+    # Fallback: use the last """ regardless
+    if new_code is None:
+        new_code = after_open[: triple_positions[-1]]
+
+    new_code = new_code.strip()
+    if not new_code:
+        return None
+
+    desc_m = (
+        re.search(r'"description"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+        or re.search(r'"description"\s*:\s*"([^"]*)"', text)
+    )
+    desc = (
+        _unescape_json_string(desc_m.group(1)) if desc_m
+        else "LLM proposal (triple-quoted)"
+    )
     return {"description": desc, "new_code": new_code}
 
 
-def _unescape_json_string(s: str) -> str:
-    """Decode a JSON string body (without outer quotes). Fallback on failure."""
-    try:
-        return json.loads('"' + s + '"')
-    except (json.JSONDecodeError, ValueError):
-        return (
-            s.replace("\\n", "\n")
-            .replace("\\t", "\t")
-            .replace('\\"', '"')
-            .replace("\\\\", "\\")
-        )
-
+# -- Stage 6 ------------------------------------------------------------------
 
 def _try_regex_quoted_fields(text: str) -> dict | None:
-    desc = re.search(r'"description"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
-    code = re.search(r'"new_code"\s*:\s*"((?:[^"\\]|\\.)*)"', text, re.DOTALL)
-    if not (desc and code):
+    """
+    Regex extraction when JSON is otherwise broken but values use proper \\\"
+    escaping.  Does NOT handle bare unescaped " inside values (stage 7 does).
+    """
+    desc_m = re.search(r'"description"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+    code_m = re.search(r'"new_code"\s*:\s*"((?:[^"\\]|\\.)*)"', text, re.DOTALL)
+    if not (desc_m and code_m):
         return None
-    body = _unescape_json_string(code.group(1))
-    d = _unescape_json_string(desc.group(1))
+    body = _unescape_json_string(code_m.group(1))
+    d    = _unescape_json_string(desc_m.group(1))
     if not body.strip():
         return None
     return {"description": d, "new_code": body}
 
 
-def _try_fenced_json_inner(text: str) -> dict | None:
-    """Parse first ```json ... ``` block as JSON (may contain extra keys)."""
-    m = re.search(r"```(?:json)?\s*\r?\n(.*?)```", text, re.DOTALL | re.IGNORECASE)
-    if not m:
-        return None
-    inner = m.group(1).strip()
-    return _try_json_raw_decode(inner) or _try_json_loads_whole(inner)
+# -- Stage 7 ------------------------------------------------------------------
 
+def _try_greedy_new_code_extract(text: str) -> dict | None:
+    """
+    FIX #4 (new): handles the case where new_code contains unescaped double
+    quotes, e.g. f-strings or print("hello").  The regex in stage 6 stops at
+    the first unescaped "; we instead scan for the LAST quote followed by the
+    JSON object's closing brace to bound the content region.
+    """
+    start_m = re.search(r'"new_code"\s*:\s*"', text)
+    if not start_m:
+        return None
+
+    raw_from_start = text[start_m.end():]
+
+    desc_m = re.search(r'"description"\s*:\s*"((?:[^"\\]|\\.){0,400})"', text)
+    desc = (
+        _unescape_json_string(desc_m.group(1)) if desc_m
+        else "LLM proposal (greedy)"
+    )
+
+    # Try patterns from most specific to most permissive
+    end_patterns = [
+        r'"\s*\n\s*\}\s*$',   # "...\n} at end-of-text
+        r'"\s*\}\s*$',         # "...} at end-of-text
+        r'"\s*\n\s*\}',        # "...\n} anywhere
+        r'"\s*\}',             # "...} anywhere
+        r'"\s*$',              # bare " at end
+    ]
+
+    raw_code: str | None = None
+    for pat in end_patterns:
+        end_m = re.search(pat, raw_from_start)
+        if end_m:
+            raw_code = raw_from_start[: end_m.start()]
+            break
+
+    if raw_code is None:
+        raw_code = raw_from_start.rstrip('"}\n\r ')
+
+    if not raw_code:
+        return None
+
+    code = _smart_decode_code(raw_code)
+    code = code.replace("\r\n", "\n").replace("\r", "\n")
+
+    if not _looks_like_train_py(code):
+        return None
+
+    return {"description": desc, "new_code": code}
+
+
+# -- Stage 8 ------------------------------------------------------------------
 
 def _try_markdown_code_blocks(text: str) -> dict | None:
-    blocks = re.findall(
-        r"```(?:python|py)?\s*\r?\n(.*?)```",
-        text,
-        re.DOTALL | re.IGNORECASE,
-    )
-    # Also ```python ... ``` without newline after fence
+    """
+    Find the best code block across ANY Markdown fence (any label or none).
+
+    FIX #6: old version only matched python/py labels; plain ``` or labels
+    like ```text / ```sh were missed by the second fallback pattern which
+    required a non-empty label.  Now we collect ALL fenced blocks regardless
+    of label and score them by content.
+    """
+    # All fenced blocks: ``` + optional label + newline + content + ```
+    blocks = re.findall(r"```[^\n]*\n(.*?)```", text, re.DOTALL)
     if not blocks:
-        blocks = re.findall(
-            r"```(?:python|py)\s+(.*?)```",
-            text,
-            re.DOTALL | re.IGNORECASE,
-        )
+        blocks = re.findall(r"```[^\n]*(.*?)```", text, re.DOTALL)
+
     best: str | None = None
     for b in blocks:
         b = b.strip()
         if _looks_like_train_py(b) and (best is None or len(b) > len(best)):
             best = b
-    if best:
-        m = re.search(
-            r"(?:description|change|summary)\s*[:#]\s*(.+?)(?:\n|$)",
-            text,
-            re.IGNORECASE,
-        )
-        desc = m.group(1).strip() if m else "LLM proposal (markdown code block)"
-        return {"description": desc[:200], "new_code": best}
-    return None
 
+    if not best:
+        return None
+
+    m = re.search(
+        r"(?:description|change|summary)\s*[:#]\s*(.+?)(?:\n|$)",
+        text, re.IGNORECASE,
+    )
+    desc = m.group(1).strip()[:200] if m else "LLM proposal (code block)"
+    return {"description": desc, "new_code": best}
+
+
+# -- Stage 9 ------------------------------------------------------------------
 
 def _try_plain_train_py(text: str) -> dict | None:
+    """Handle the case where the LLM returned raw Python with no JSON wrapper."""
     t = text.strip()
     if t.startswith("{") or t.startswith("["):
         return None
-    if _looks_like_train_py(t):
-        line = t.splitlines()[0].strip("# ")[:120]
-        desc = line if line else "LLM returned raw train.py"
-        return {"description": desc, "new_code": t}
-    return None
+    if not _looks_like_train_py(t):
+        return None
+    # Use the first meaningful line as description
+    for line in t.splitlines():
+        line = line.strip().lstrip("#").strip().strip('"').strip("'").strip()
+        if line and len(line) > 5:
+            return {"description": line[:120], "new_code": t}
+    return {"description": "LLM returned raw train.py", "new_code": t}
 
 
-def _parse_llm_proposal(text: str) -> dict:
+# ── Master parser dispatcher ──────────────────────────────────────────────────
+
+def _parse_llm_proposal(raw_text: str) -> dict:
     """
-    Extract {"description", "new_code"} from arbitrary LLM output.
-    Tries strict JSON first, then common malformed patterns, then markdown / raw code.
+    Extract {"description": str, "new_code": str} from ANY LLM response.
+
+    Ten-stage waterfall -- stops at first success.
+    See module-level comment above the stage functions for the full table.
     """
-    raw = text
-    text = _normalize_llm_text(text)
+    # Normalize Unicode in raw text and strip an outer code fence if present
+    text = _normalize_llm_text(raw_text)
     text = _strip_outer_markdown_fence(text)
 
+    # Stages 1-2: strict JSON
+    for fn in (_try_json_raw_decode, _try_json_loads_whole):
+        out = fn(text)
+        if out:
+            return out
+
+    # Stage 3: fix literal \n then retry strict JSON
+    fixed_nl = _fix_json_literal_newlines(text)
+    if fixed_nl != text:
+        for fn in (_try_json_raw_decode, _try_json_loads_whole):
+            out = fn(fixed_nl)
+            if out:
+                return out
+
+    # Stages 4-7: structural / regex parsers on normalized text
     for fn in (
-        _try_json_raw_decode,
-        _try_json_loads_whole,
         _try_fenced_json_inner,
         _try_triple_quote_new_code,
         _try_regex_quoted_fields,
+        _try_greedy_new_code_extract,
     ):
         out = fn(text)
         if out:
             return out
 
-    text2 = _normalize_llm_text(raw)
-    out = _try_markdown_code_blocks(text2)
-    if out:
-        return out
-    out = _try_markdown_code_blocks(text)
-    if out:
-        return out
-
-    out = _try_plain_train_py(text2)
-    if out:
-        return out
-
-    out = _try_plain_train_py(text)
-    if out:
-        return out
+    # Stages 8-9: code-level parsers
+    # Try both the normalized and the raw-then-normalized versions to maximize hits
+    raw_normalized = _normalize_llm_text(raw_text)
+    for fn in (_try_markdown_code_blocks, _try_plain_train_py):
+        out = fn(raw_normalized) or fn(text)
+        if out:
+            return out
 
     raise ValueError(
-        "Cannot parse LLM response (no JSON with new_code, no train.py-like code block).\n"
-        f"First 500 chars:\n{text2[:500]}"
+        "Cannot parse LLM response -- all 10 parser stages failed.\n"
+        f"First 600 chars:\n{raw_normalized[:600]}"
     )
 
 
+# ── Experiment proposal ───────────────────────────────────────────────────────
+
 def propose_experiment(history: list[dict], current_code: str) -> dict:
     history_block = "\n".join(
-        f"  exp{i+1:02d}: {h['description']}  →  "
+        f"  exp{i+1:02d}: {h['description']}  ->  "
         f"mAP50-95={h['val_mAP5095']:.4f}  ({h['status']})"
         for i, h in enumerate(history)
-    ) or "  (none yet — this will be the baseline)"
+    ) or "  (none yet -- this will be the baseline)"
+
+    code_chars = len(current_code)
+
+    # FIX #9: system prompt rewritten to be explicit about JSON encoding,
+    # ASCII-only (not just in comments), config-section scope, and length.
+    system_prompt = (
+        "You are an expert computer vision researcher optimising YOLO11 "
+        "fine-tuning on a small custom dataset.\n"
+        f"Goal: maximise val/mAP50-95. Training runs on {NUM_GPUS} GPU(s).\n\n"
+
+        "OUTPUT FORMAT -- reply with ONLY this JSON object, nothing else:\n"
+        '  {"description": "one-line summary", "new_code": "<complete train.py>"}\n\n'
+
+        "CRITICAL JSON ENCODING RULES for the new_code value:\n"
+        "  1. Every newline in the Python source -> the two characters: \\ n\n"
+        "  2. Every double-quote in the Python source -> the two characters: \\ \"\n"
+        "  3. Every backslash in the Python source -> the two characters: \\ \\\n"
+        "  4. The value must pass json.loads() without error\n"
+        "  5. Do NOT use triple-quotes around new_code -- it must be a JSON string\n"
+        "  6. Do NOT wrap the response in markdown fences\n\n"
+
+        "CONTENT RULES:\n"
+        "  - The Python file starts with a triple-quoted docstring on the very first line\n"
+        "  - Use ONLY printable ASCII characters throughout the ENTIRE file\n"
+        "    (absolutely no Unicode: no curly quotes, no em-dashes, no non-breaking spaces)\n"
+        "  - ONLY modify constants in the config section "
+        "(above the '# Do NOT edit below this line' comment)\n"
+        "  - Keep ALL function bodies, imports, and boilerplate byte-for-byte identical\n"
+        f"  - Current file is {code_chars} characters; new_code must be similar in size\n"
+    )
+
+    user_prompt = (
+        f"Experiment history:\n{history_block}\n\n"
+        f"Current train.py ({code_chars} chars):\n{current_code}\n\n"
+        "Pick ONE change most likely to improve val/mAP50-95 for small-data fine-tuning.\n"
+        "Good candidates: EPOCHS, LR0, LRF, OPTIMIZER, WARMUP_EPOCHS, WEIGHT_DECAY, "
+        "DROPOUT, LABEL_SMOOTHING, MOSAIC, MIXUP, CLOSE_MOSAIC, IMGSZ, BATCH, MODEL_SIZE.\n"
+        "Return the COMPLETE modified train.py as new_code."
+    )
 
     messages = [
-        {
-            "role"   : "system",
-            "content": (
-                "You are an expert computer vision researcher optimising YOLO11 "
-                "fine-tuning on a small custom dataset. "
-                "Your goal is to maximise val/mAP50-95. "
-                f"Training runs on {NUM_GPUS} GPU(s). "
-                "Reply ONLY with a single JSON object: "
-                '{"description": "one-line summary", "new_code": "<entire train.py as one JSON string>"}. '
-                "new_code MUST be valid JSON: escape every newline inside the string as \\n "
-                'and quotes as \\". Do NOT use Python triple quotes \"\"\" around new_code. '
-                "The train.py source must start with \"\"\" (docstring) as the very first characters; "
-                "use ASCII only in comments (no Unicode em-dashes). "
-                "No markdown fences, no text outside the JSON object."
-            ),
-        },
-        {
-            "role"   : "user",
-            "content": (
-                f"Experiment history:\n{history_block}\n\n"
-                f"Current train.py:\n{current_code}\n\n"
-                "Pick ONE change most likely to improve val/mAP50-95 for small-data "
-                "fine-tuning. Good candidates: LR schedule, augmentation strength, "
-                "mosaic/mixup, close_mosaic, optimizer, warmup, weight decay, "
-                "dropout, label smoothing, model size, imgsz.\n"
-                "Return the complete modified train.py as new_code."
-            ),
-        },
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": user_prompt},
     ]
     return _parse_llm_proposal(_call_api_with_retry(messages))
 
 
+# ── Validation ────────────────────────────────────────────────────────────────
+
 def _validate_train_py_source(src: str) -> None:
-    """Reject LLM output that is not valid Python (prevents SyntaxError at train time)."""
+    """
+    Reject LLM output that is not syntactically valid Python.
+
+    FIX #10: old version showed only line number; now prints code context
+    (3 lines before, 2 after) around the error for easier debugging.
+    """
     s = src.lstrip("\ufeff \t\r\n")
     if not (s.startswith('"""') or s.startswith("'''")):
         raise ValueError(
-            'train.py must start with a triple-quoted docstring (""" on line 1). '
-            "LLM output may be truncated or missing the opening quotes."
+            "train.py must start with a triple-quoted docstring on line 1.\n"
+            f"Got first 80 chars: {s[:80]!r}"
         )
     try:
         compile(src, str(_TRAIN_FILE), "exec")
     except SyntaxError as e:
+        lines = src.splitlines()
+        lo  = max(0, (e.lineno or 1) - 3)
+        hi  = min(len(lines), (e.lineno or 1) + 2)
+        ctx = "\n".join(
+            f"  {'>>>' if idx + 1 == e.lineno else '   '} {idx+1:4d}  {lines[idx]}"
+            for idx in range(lo, hi)
+        )
         raise ValueError(
-            f"train.py from LLM has a syntax error (line {e.lineno}): {e.msg}"
+            f"SyntaxError on line {e.lineno}: {e.msg}\n{ctx}"
         ) from e
 
 
@@ -401,7 +736,6 @@ def git_commit(msg: str) -> str:
         capture_output=True,
     )
     if r.returncode != 0 and b"nothing to commit" in r.stdout + r.stderr:
-        # Nothing changed (e.g. baseline); return current HEAD
         pass
     return subprocess.check_output(
         ["git", "-C", str(_ROOT), "rev-parse", "--short", "HEAD"], text=True
@@ -409,7 +743,7 @@ def git_commit(msg: str) -> str:
 
 
 def git_reset_last() -> None:
-    """Discard the last commit (experiment that didn't improve)."""
+    """Discard the last commit (experiment that did not improve)."""
     subprocess.run(
         ["git", "-C", str(_ROOT), "reset", "--hard", "HEAD~1"],
         capture_output=True,
@@ -418,88 +752,70 @@ def git_reset_last() -> None:
 
 # ── Training & metrics ────────────────────────────────────────────────────────
 
-def _run_training_unix_tee(
-    cmd: list[str],
+def _stream_process(
+    proc: subprocess.Popen,
+    log_f,
     timeout: float | None,
-    env: dict[str, str],
 ) -> tuple[bool, float]:
     """
-    Linux/macOS/Kaggle: run through `tee` so output inherits the real TTY.
-    `torch.distributed` worker logs often do not show up when the parent uses
-    subprocess.PIPE (Jupyter then stays blank until the run ends).
+    Read process stdout LINE BY LINE so every YOLO progress line appears
+    in the terminal immediately.  Uses text-mode line iterator (not chunk reads)
+    so Kaggle notebooks see output in real time.
     """
-    cmd_str = " ".join(shlex.quote(c) for c in cmd)
-    logf = shlex.quote(str(_LOG_FILE))
-    print("  ── training log (live; also saved to run.log) ──")
-    sys.stdout.flush()
-    bash_cmd = f"set -o pipefail && {cmd_str} 2>&1 | tee {logf}"
-    t0 = time.time()
-    try:
-        r = subprocess.run(
-            bash_cmd,
-            shell=True,
-            cwd=str(_ROOT),
-            env=env,
-            executable="/bin/bash",
-            timeout=timeout,
-        )
-        return r.returncode == 0, time.time() - t0
-    except subprocess.TimeoutExpired:
-        elapsed = time.time() - t0
-        print(f"\n  [TIMEOUT] killed after {elapsed:.0f}s")
-        return False, elapsed
-
-
-def _run_training_pipe_tee(
-    cmd: list[str],
-    timeout: float | None,
-    env: dict[str, str],
-) -> tuple[bool, float]:
-    """Windows fallback: copy pipe output to stdout and run.log."""
     t0 = time.time()
     timed_out = False
-    proc: subprocess.Popen | None = None
 
-    def _kill_if_stale() -> None:
-        nonlocal timed_out, proc
-        if timeout is None or timeout <= 0:
+    def _watchdog():
+        nonlocal timed_out
+        if not timeout:
             return
         time.sleep(timeout)
-        if proc is not None and proc.poll() is None:
+        if proc.poll() is None:
             timed_out = True
             proc.kill()
 
-    with open(_LOG_FILE, "w") as log_f:
-        print("  ── training log (live; also saved to run.log) ──")
-        sys.stdout.flush()
+    if timeout:
+        threading.Thread(target=_watchdog, daemon=True).start()
+
+    assert proc.stdout is not None
+    try:
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            log_f.write(line)
+            log_f.flush()
+    except BrokenPipeError:
+        pass
+
+    rc      = proc.wait()
+    elapsed = time.time() - t0
+
+    if timed_out:
+        print(f"\n  [TIMEOUT] killed after {timeout:.0f}s")
+        return False, elapsed
+
+    return rc == 0, elapsed
+
+
+def _launch_training(
+    cmd: list[str],
+    timeout: float | None,
+    env: dict[str, str],
+) -> tuple[bool, float]:
+    print("  -- training log (live; also saved to run.log) --")
+    sys.stdout.flush()
+
+    with open(_LOG_FILE, "w", buffering=1) as log_f:
         proc = subprocess.Popen(
             cmd,
             cwd=str(_ROOT),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=0,
+            bufsize=1,    # line-buffered on OS side
             env=env,
         )
-        threading.Thread(target=_kill_if_stale, daemon=True).start()
-        assert proc.stdout is not None
-        try:
-            while True:
-                chunk = proc.stdout.read(4096)
-                if not chunk:
-                    break
-                sys.stdout.write(chunk)
-                sys.stdout.flush()
-                log_f.write(chunk)
-                log_f.flush()
-        except BrokenPipeError:
-            pass
-        rc = proc.wait()
-        elapsed = time.time() - t0
-        if timed_out and timeout is not None:
-            print(f"\n  [TIMEOUT] killed after {timeout:.0f}s")
-            return False, elapsed
-        return rc == 0, elapsed
+        return _stream_process(proc, log_f, timeout)
 
 
 def run_training(
@@ -508,25 +824,21 @@ def run_training(
     *,
     quiet: bool = False,
 ) -> tuple[bool, float]:
-    """
-    Run train.py. By default streams stdout/stderr to the terminal and run.log.
-    On Linux/macOS, uses `tee` so notebooks (e.g. Kaggle) show distributed logs live.
-    Set quiet=True to only write run.log (no live output).
-    """
     cmd = build_cmd(num_gpus)
-    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    env = {
+        **os.environ,
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONIOENCODING": "utf-8",
+    }
 
     if quiet:
         t0 = time.time()
         try:
             with open(_LOG_FILE, "w") as log_out:
                 proc = subprocess.run(
-                    cmd,
-                    cwd=str(_ROOT),
-                    stdout=log_out,
-                    stderr=subprocess.STDOUT,
-                    timeout=timeout,
-                    env=env,
+                    cmd, cwd=str(_ROOT),
+                    stdout=log_out, stderr=subprocess.STDOUT,
+                    timeout=timeout, env=env,
                 )
             return proc.returncode == 0, time.time() - t0
         except subprocess.TimeoutExpired:
@@ -534,15 +846,8 @@ def run_training(
             print(f"  [TIMEOUT] killed after {elapsed:.0f}s")
             return False, elapsed
 
-    if hasattr(sys.stdout, "reconfigure"):
-        try:
-            sys.stdout.reconfigure(line_buffering=True)
-        except (OSError, ValueError):
-            pass
-
-    if sys.platform != "win32" and os.path.isfile("/bin/bash"):
-        return _run_training_unix_tee(cmd, timeout, env)
-    return _run_training_pipe_tee(cmd, timeout, env)
+    _force_unbuffered_stdout()
+    return _launch_training(cmd, timeout, env)
 
 
 def parse_metrics() -> dict[str, float]:
@@ -566,13 +871,13 @@ def parse_metrics() -> dict[str, float]:
 
 _TSV_HEADER = "commit\tval_mAP5095\tval_mAP50\tmemory_gb\tstatus\tdescription\n"
 
+
 def _ensure_results_file() -> None:
     if not Path(_RESULTS_FILE).exists():
         Path(_RESULTS_FILE).write_text(_TSV_HEADER)
 
 
 def load_history() -> list[dict]:
-    """Load completed experiments from results.tsv for --resume."""
     history = []
     p = Path(_RESULTS_FILE)
     if not p.exists():
@@ -630,10 +935,9 @@ def main() -> None:
     parser.add_argument("--dry-run",      action="store_true",
                         help="Propose experiments without training")
     parser.add_argument("--quiet",        action="store_true",
-                        help="Do not print training logs to the terminal (still write run.log)")
+                        help="Do not print training logs to terminal (still writes run.log)")
     args = parser.parse_args()
 
-    # ── Environment ----------------------------------------------------------
     OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
     if not OPENROUTER_API_KEY:
         sys.exit("ERROR: set OPENROUTER_API_KEY environment variable")
@@ -647,7 +951,6 @@ def main() -> None:
     else:
         NUM_GPUS = args.gpus or detect_gpus()
 
-    # ── Git branch ----------------------------------------------------------
     tag    = datetime.now().strftime("%b%d").lower()
     branch = f"autoresearch/{tag}"
     r = subprocess.run(
@@ -661,30 +964,25 @@ def main() -> None:
         )
 
     if not _TRAIN_FILE.is_file():
-        sys.exit(
-            f"ERROR: {_TRAIN_FILE} not found. Add train.py next to autoresearch.py "
-            "(or clone the full AutoResearch-Det repo)."
-        )
+        sys.exit(f"ERROR: {_TRAIN_FILE} not found.")
 
     _ensure_results_file()
 
-    # ── Resume: reload history -----------------------------------------------
-    history       = load_history() if args.resume else []
-    completed     = len(history)
-    remaining     = args.experiments - completed
-    best_mAP      = max((h["val_mAP5095"] for h in history), default=0.0)
+    history      = load_history() if args.resume else []
+    completed    = len(history)
+    best_mAP     = max((h["val_mAP5095"] for h in history), default=0.0)
     baseline_time: float | None = None
 
     if args.resume and completed > 0:
-        print(f"[resume] Loaded {completed} completed experiments, best mAP={best_mAP:.4f}")
+        print(f"[resume] Loaded {completed} experiments, best mAP={best_mAP:.4f}")
 
     cmd_str = " ".join(build_cmd(NUM_GPUS))
     print(f"\n{'='*62}")
     print(f"  AutoResearch-DET  |  YOLO11 fine-tuning")
     print(f"  Branch      : {branch}")
     print(f"  LLM model   : {LLM_MODEL}")
-    print(f"  GPUs        : {NUM_GPUS}  →  {cmd_str}")
-    print(f"  Experiments : {remaining} remaining / {args.experiments} total")
+    print(f"  GPUs        : {NUM_GPUS}  ->  {cmd_str}")
+    print(f"  Experiments : {args.experiments - completed} remaining / {args.experiments} total")
     if args.dry_run:
         print(f"  Mode        : DRY-RUN (no training)")
     if args.quiet:
@@ -693,28 +991,30 @@ def main() -> None:
 
     for exp_num in range(completed + 1, args.experiments + 1):
         if _shutdown_requested:
-            print("\n[!] Graceful shutdown — results saved.")
+            print("\n[!] Graceful shutdown -- results saved.")
             break
 
-        print(f"\n── Experiment {exp_num:02d}/{args.experiments:02d} " + "─" * 38)
+        print(f"\n{'='*62}")
+        print(f"  Experiment {exp_num:02d} / {args.experiments:02d}")
+        print(f"{'='*62}")
 
         current_code = Path(_TRAIN_FILE).read_text(errors="ignore")
 
-        # ── Propose ---------------------------------------------------------
         if exp_num == 1:
-            description = "baseline — default hyperparameters"
+            description = "baseline -- default hyperparameters"
             print(f"  Idea  : {description}")
         else:
-            print("  LLM   : proposing next experiment…")
+            print("  LLM   : proposing next experiment...")
             try:
                 proposal    = propose_experiment(history, current_code)
                 description = proposal["description"]
                 if not args.dry_run:
-                    _validate_train_py_source(proposal["new_code"])
-                    Path(_TRAIN_FILE).write_text(proposal["new_code"])
+                    clean_code = _sanitize_train_py(proposal["new_code"])
+                    _validate_train_py_source(clean_code)
+                    Path(_TRAIN_FILE).write_text(clean_code, encoding="utf-8")
                 print(f"  Idea  : {description}")
             except Exception as exc:
-                print(f"  LLM error: {exc} — skipping")
+                print(f"  LLM error: {exc} -- skipping")
                 continue
 
         if args.dry_run:
@@ -722,14 +1022,13 @@ def main() -> None:
             history.append({"description": description, "val_mAP5095": 0.0, "status": "dry-run"})
             continue
 
-        # ── Commit ----------------------------------------------------------
         commit  = git_commit(f"experiment: {description}")
         timeout = baseline_time * _TIMEOUT_FACTOR if baseline_time else None
         print(f"  Commit: {commit}  |  timeout: "
               f"{f'{timeout:.0f}s' if timeout else 'none'}")
 
-        # ── Train -----------------------------------------------------------
-        print("  Training…")
+        print("  Training...\n")
+        sys.stdout.flush()
         success, elapsed = run_training(NUM_GPUS, timeout, quiet=args.quiet)
         if exp_num == 1:
             baseline_time = elapsed
@@ -737,8 +1036,9 @@ def main() -> None:
         metrics     = parse_metrics()
         val_mAP5095 = metrics["val_mAP5095"]
 
+        print()
         if not success or val_mAP5095 == 0.0:
-            print(f"  ✗  CRASH  ({elapsed:.0f}s)  — see {_LOG_FILE}")
+            print(f"  X  CRASH  ({elapsed:.0f}s)  -- see {_LOG_FILE}")
             append_result(commit, metrics, "crash", description)
             history.append({"description": description, "val_mAP5095": 0.0, "status": "crash"})
             git_reset_last()
@@ -752,31 +1052,29 @@ def main() -> None:
             f"time={elapsed:.0f}s"
         )
 
-        # ── Keep / discard --------------------------------------------------
         if val_mAP5095 > best_mAP:
             best_mAP = val_mAP5095
             status   = "keep"
-            print(f"  ✓  KEEP   (Δ={val_mAP5095 - prev:+.4f})")
+            print(f"  v  KEEP   (delta={val_mAP5095 - prev:+.4f})")
         else:
             status = "discard"
-            print(f"  ✗  DISCARD (Δ={val_mAP5095 - prev:+.4f})")
-            if exp_num > 1:  # never reset baseline
+            print(f"  X  DISCARD (delta={val_mAP5095 - prev:+.4f})")
+            if exp_num > 1:
                 git_reset_last()
 
         append_result(commit, metrics, status, description)
         history.append({"description": description, "val_mAP5095": val_mAP5095, "status": status})
         update_plot()
 
-    # ── Final summary --------------------------------------------------------
     if not history:
         print("No experiments completed.")
         return
 
-    done          = [h for h in history if h["status"] not in ("crash", "dry-run")]
-    best          = max(history, key=lambda h: h["val_mAP5095"])
-    baseline_map  = history[0]["val_mAP5095"]
-    delta         = best["val_mAP5095"] - baseline_map
-    pct           = delta / baseline_map * 100 if baseline_map > 0 else 0.0
+    done         = [h for h in history if h["status"] not in ("crash", "dry-run")]
+    best         = max(history, key=lambda h: h["val_mAP5095"])
+    baseline_map = history[0]["val_mAP5095"]
+    delta        = best["val_mAP5095"] - baseline_map
+    pct          = delta / baseline_map * 100 if baseline_map > 0 else 0.0
 
     print(f"\n{'='*62}")
     print(f"  AUTORESEARCH COMPLETE  ({len(history)} experiments, {len(done)} successful)")
