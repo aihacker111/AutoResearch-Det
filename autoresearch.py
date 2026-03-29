@@ -553,7 +553,7 @@ def propose_experiment(history: list[dict], current_code: str) -> dict:
     code_chars = len(current_code)
     fixed_str  = ", ".join(_FIXED_PARAMS)
 
-    system_prompt = (
+        system_prompt = (
         "You are an expert computer vision researcher optimising YOLO11 "
         "fine-tuning on a small custom dataset.\n"
         f"Goal: maximise val/mAP50-95. Training runs on {NUM_GPUS} GPU(s).\n\n"
@@ -562,30 +562,34 @@ def propose_experiment(history: list[dict], current_code: str) -> dict:
         '  {"description": "one-line summary", "new_code": "<complete train.py>"}\n\n'
 
         "CRITICAL JSON ENCODING RULES for the new_code value:\n"
-        "  1. Every newline in the Python source -> the two characters: \\ n\n"
-        "  2. Every double-quote in the Python source -> the two characters: \\ \"\n"
-        "  3. Every backslash in the Python source -> the two characters: \\ \\\n"
-        "  4. The value must pass json.loads() without error\n"
-        "  5. Do NOT use triple-quotes around new_code -- it must be a JSON string\n"
-        "  6. Do NOT wrap the response in markdown fences\n\n"
+        "  1. Every newline -> \\n\n"
+        "  2. Every double-quote -> \\\"\n"
+        "  3. Every backslash -> \\\\\n"
+        "  4. Must be valid json.loads()\n"
+        "  5. Do NOT use triple-quotes or markdown fences\n\n"
 
-        "CONTENT RULES:\n"
+        "CONTENT RULES (VERY STRICT):\n"
         "  - The Python file starts with a triple-quoted docstring on the very first line\n"
-        "  - Use ONLY printable ASCII characters throughout the ENTIRE file\n"
-        "    (absolutely no Unicode: no curly quotes, no em-dashes, no non-breaking spaces)\n"
-        "  - ONLY modify constants in the config section "
-        "(above the '# Do NOT edit below this line' comment)\n"
-        "  - Keep ALL function bodies, imports, and boilerplate byte-for-byte identical\n"
-        f"  - Current file is {code_chars} characters; new_code must be similar in size\n"
+        "  - ONLY modify constants in the config section (above the '# Do NOT edit below this line' comment)\n"
+        "  - You MUST change EXACTLY ONE hyperparameter\n"
+        "    OR one closely related group (allowed groups are listed below).\n"
+        "    This is critical for clear attribution of which change improved the metric.\n\n"
+        "Allowed related groups (only these):\n"
+        "  • HSV_H, HSV_S, HSV_V\n"
+        "  • DEGREES, TRANSLATE, SCALE, SHEAR\n"
+        "  • MOSAIC, MIXUP, COPY_PASTE\n"
+        "  • LR0, LRF\n"
+        "  • WARMUP_EPOCHS, WARMUP_BIAS_LR\n"
+        "  • DROPOUT, LABEL_SMOOTHING\n"
         f"  - Do NOT change {fixed_str} -- these are fixed across ALL experiments\n"
-        "    to ensure fair comparison (same training budget, input resolution,\n"
-        "    hardware settings, and numerical precision)\n"
+        "  - Current file is {code_chars} characters; new_code must be similar in size\n"
+        "  - Use ONLY printable ASCII characters (no Unicode)\n"
     )
 
     user_prompt = (
         f"Experiment history:\n{history_block}\n\n"
         f"Current train.py ({code_chars} chars):\n{current_code}\n\n"
-        "Pick ONE change most likely to improve val/mAP50-95 for small-data fine-tuning.\n"
+        "Pick EXACTLY ONE change (or one allowed related group) most likely to improve val/mAP50-95.\n"
         "Good candidates: LR0, LRF, OPTIMIZER, MOMENTUM, WEIGHT_DECAY, "
         "WARMUP_EPOCHS, WARMUP_BIAS_LR, DROPOUT, LABEL_SMOOTHING, "
         "MOSAIC, MIXUP, COPY_PASTE, CLOSE_MOSAIC, PATIENCE, MODEL_SIZE.\n"
@@ -640,6 +644,48 @@ def _validate_fixed_params(new_src: str, original_src: str) -> None:
                 f"{orig_m.group(1).strip()!r} -> {new_m.group(1).strip()!r}"
             )
 
+
+
+def _validate_single_change(new_src: str, original_src: str) -> None:
+    """Buộc agent chỉ được thay ĐÚNG 1 hyperparameter 
+    HOẶC 1 nhóm liên quan chặt chẽ (định nghĩa rõ ràng).
+    Mục tiêu: attribution rõ ràng, experiment dễ trace."""
+    
+    param_re = re.compile(r'^([A-Z0-9_]+)\s*=\s*(.+?)(?:\s*#.*)?$', re.MULTILINE)
+
+    orig_params = dict(param_re.findall(original_src))
+    new_params  = dict(param_re.findall(new_src))
+
+    changed: list[str] = []
+    for k in set(orig_params) & set(new_params):
+        if orig_params[k].strip() != new_params[k].strip():
+            changed.append(k)
+
+    if len(changed) <= 1:
+        return  # chỉ thay 1 tham số → OK
+
+    # ================== NHÓM LIÊN QUAN CHẶT CHẼ ĐƯỢC PHÉP ==================
+    allowed_groups = [
+        {"HSV_H", "HSV_S", "HSV_V"},                    # Color augmentation
+        {"DEGREES", "TRANSLATE", "SCALE", "SHEAR"},     # Geometry augmentation
+        {"MOSAIC", "MIXUP", "COPY_PASTE"},              # Advanced mosaic & mix
+        {"LR0", "LRF"},                                 # Learning rate schedule
+        {"WARMUP_EPOCHS", "WARMUP_BIAS_LR"},            # Warmup strategy
+        {"DROPOUT", "LABEL_SMOOTHING"},                 # Regularization
+    ]
+
+    changed_set = set(changed)
+    for group in allowed_groups:
+        if changed_set <= group:        # toàn bộ changed nằm trong 1 group
+            return  # hợp lệ
+
+    # Nếu không thuộc bất kỳ group nào → reject
+    raise ValueError(
+        f"LLM changed {len(changed)} parameters: {changed}.\n"
+        "Quy tắc: Chỉ được thay ĐÚNG 1 hyperparameter "
+        "hoặc 1 nhóm liên quan chặt chẽ (ví dụ: cả 3 HSV_*, hoặc LR0+LRF).\n"
+        "Không được thay nhiều tham số không liên quan trong cùng 1 experiment."
+    )
 
 # ── Git helpers ───────────────────────────────────────────────────────────────
 
@@ -820,19 +866,27 @@ def run_training(
 
 
 def parse_metrics() -> dict[str, float]:
+    """Parse metrics từ summary.json mà train.py đã ghi sẵn."""
     metrics: dict[str, float] = {
         "val_mAP5095" : 0.0,
         "val_mAP50"   : 0.0,
         "peak_vram_mb": 0.0,
     }
-    try:
-        for line in Path(_LOG_FILE).read_text(errors="ignore").splitlines():
-            for key in metrics:
-                m = re.match(rf"^{key}:\s+([\d.]+)", line)
-                if m:
-                    metrics[key] = float(m.group(1))
-    except FileNotFoundError:
-        pass
+
+    output_dir = os.environ.get("OUTPUT_DIR", "output/train")
+    summary_path = Path(output_dir) / "exp" / "summary.json"   # ← Đường dẫn tới file
+
+    if summary_path.is_file():
+        try:
+            data = json.loads(summary_path.read_text(encoding="utf-8"))   # ← DÒNG NÀY ĐỌC FILE
+            metrics["val_mAP5095"] = float(data.get("val_mAP5095", 0.0))
+            metrics["val_mAP50"]   = float(data.get("val_mAP50", 0.0))
+            metrics["peak_vram_mb"] = float(data.get("peak_vram_mb", 0.0))
+        except Exception as e:
+            print(f"  [parse_metrics] warning: cannot read summary.json ({e})")
+    else:
+        print(f"  [parse_metrics] warning: summary.json not found at {summary_path}")
+
     return metrics
 
 
@@ -1007,6 +1061,7 @@ def main() -> None:
                 if not args.dry_run:
                     clean_code = _sanitize_train_py(proposal["new_code"])
                     _validate_train_py_source(clean_code)
+                    _validate_fixed_params(clean_code, current_code)
                     _validate_fixed_params(clean_code, current_code)
                     Path(_TRAIN_FILE).write_text(clean_code, encoding="utf-8")
                 print(f"  Idea  : {description}")
