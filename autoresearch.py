@@ -56,7 +56,7 @@ _LLM_MAX_TOKENS = 6000
 # Parameters that must never be changed by the LLM -- changing these would
 # make experiment comparisons unfair (different training budget / hardware
 # settings / numerical precision).
-_FIXED_PARAMS = ("MODEL_SIZE", "PRETRAINED", "EPOCHS", "IMGSZ", "BATCH", "WORKERS", "AMP")
+_FIXED_PARAMS = ("MODEL_SIZE", "PRETRAINED", "EPOCHS", "IMGSZ", "BATCH", "WORKERS", "AMP", "PATIENCE")
 
 # Runtime globals
 OPENROUTER_API_KEY: str = ""
@@ -703,21 +703,24 @@ def _validate_train_py_source(src: str) -> None:
 
 
 def _validate_fixed_params(new_src: str, original_src: str) -> None:
-    """
-    Ensure the LLM did not touch any of the fixed parameters defined in
-    _FIXED_PARAMS.  These must stay identical across all experiments so that
-    results are directly comparable (same training budget, resolution, hardware
-    settings, and numerical precision).
-    """
+    # Regex chuẩn hóa: strip comment giống _validate_single_change
+    param_re = r'^{param}\s*=\s*(.+?)(?:\s*#.*)?$'
+
     for param in _FIXED_PARAMS:
-        orig_m = re.search(rf"^{param}\s*=\s*(.+)$", original_src, re.MULTILINE)
-        new_m  = re.search(rf"^{param}\s*=\s*(.+)$", new_src,      re.MULTILINE)
+        orig_m = re.search(param_re.format(param=param), original_src, re.MULTILINE)
+        new_m  = re.search(param_re.format(param=param), new_src,      re.MULTILINE)
+
+        # Fix 2: nếu param bị xóa khỏi file → reject luôn
+        if orig_m and not new_m:
+            raise ValueError(
+                f"LLM removed fixed param {param} from train.py — not allowed."
+            )
+
         if orig_m and new_m and orig_m.group(1).strip() != new_m.group(1).strip():
             raise ValueError(
                 f"LLM changed fixed param {param}: "
                 f"{orig_m.group(1).strip()!r} -> {new_m.group(1).strip()!r}"
             )
-
 
 
 def _validate_single_change(new_src: str, original_src: str) -> None:
@@ -1185,7 +1188,7 @@ def main() -> None:
                     clean_code = _sanitize_train_py(proposal["new_code"])
                     _validate_train_py_source(clean_code)
                     _validate_fixed_params(clean_code, current_code)
-                    _validate_fixed_params(clean_code, current_code)
+                    _validate_single_change(clean_code, current_code)
                     Path(_TRAIN_FILE).write_text(clean_code, encoding="utf-8")
                 print(f"  Idea  : {description}")
             except Exception as exc:

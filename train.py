@@ -16,7 +16,7 @@ PRETRAINED = True       # start from COCO pretrained weights
 DATA_YAML  = "data.yaml"
 
 # -- Training schedule ---------------------------------------------------------
-EPOCHS        = 2
+EPOCHS        = 20
 PATIENCE      = 15          # ^ slightly more tolerance
 IMGSZ         = 640
 CLOSE_MOSAIC  = 15          # ^ disable mosaic earlier for small-data stability
@@ -50,8 +50,8 @@ DROPOUT         = 0.0
 LABEL_SMOOTHING = 0.0
 
 # -- Hardware ------------------------------------------------------------------
-BATCH   = 16
-WORKERS = 4
+BATCH   = 64
+WORKERS = 8
 AMP     = True
 
 # -----------------------------------------------------------------------------
@@ -120,6 +120,18 @@ def _resolve_data_yaml() -> str:
             "  Or: export DATA_YAML=/path/to/your/data.yaml"
         )
     return str(p)
+
+
+def _is_global_rank0() -> bool:
+    """
+    Under torch.distributed.run, each GPU runs a copy of this script; only rank 0
+    has full validation metrics in `results`. Other ranks often show mAP 0 — so we
+    must not print/write summary from them (avoids duplicate blocks + summary.json races).
+    """
+    try:
+        return int(os.environ.get("RANK", "0")) == 0
+    except ValueError:
+        return True
 
 
 def main():
