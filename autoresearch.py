@@ -50,7 +50,6 @@ _GIT_TRAIN_PATH = "train.py"
 _TIMEOUT_FACTOR = 2.5
 _LLM_RETRIES    = 3
 _LLM_RETRY_WAIT = 5    # seconds between retries
-# FIX #1: was 3000 -- train.py JSON-encoded is ~2k tokens; leave headroom for expansion
 _LLM_MAX_TOKENS = 6000
 
 # Runtime globals
@@ -143,12 +142,10 @@ def _call_api_with_retry(messages: list[dict], max_tokens: int = _LLM_MAX_TOKENS
 
 # ── Unicode / encoding helpers ────────────────────────────────────────────────
 
-# FIX #8: comprehensive table -- old version only had 4 entries and missed
-# CRLF, zero-width chars, non-breaking space, BOM, and many quote variants.
 _UNICODE_REPLACEMENTS: tuple[tuple[str, str], ...] = (
     # Quotation marks (all variants LLMs emit)
     ("\u2018", "'"),   # left single quotation mark
-    ("\u2019", "'"),   # right single quotation mark  <-- most common culprit
+    ("\u2019", "'"),   # right single quotation mark
     ("\u201a", "'"),   # single low-9 quotation mark
     ("\u201b", "'"),   # single high-reversed-9 quotation mark
     ("\u201c", '"'),   # left double quotation mark
@@ -185,11 +182,7 @@ def _normalize_llm_text(text: str) -> str:
 
 
 def _sanitize_train_py(src: str) -> str:
-    """
-    Full sanitization of LLM-generated train.py before writing to disk.
-    FIX #8: added CRLF->LF, zero-width chars, non-breaking space, BOM,
-    and 14 additional Unicode quote/dash variants.
-    """
+    """Full sanitization of LLM-generated train.py before writing to disk."""
     for bad, good in _UNICODE_REPLACEMENTS:
         src = src.replace(bad, good)
     # Windows -> Unix line endings
@@ -201,23 +194,6 @@ def _sanitize_train_py(src: str) -> str:
 
 
 # ── LLM output parsing ────────────────────────────────────────────────────────
-#
-# Ten-stage waterfall. Each parser returns {"description": str, "new_code": str}
-# or None. The master dispatcher (_parse_llm_proposal) stops at first success.
-#
-# Stage  Parser                       Handles
-# -----  ---------------------------  ----------------------------------------
-#   1    _try_json_raw_decode         Valid JSON, possibly with prose before it
-#   2    _try_json_loads_whole        Clean JSON response
-#   3    _fix_json_literal_newlines   Most common mistake: \n not escaped as \\n
-#        -> retry stages 1-2
-#   4    _try_fenced_json_inner       ```json {...} ``` (inner retried 1-3)
-#   5    _try_triple_quote_new_code   "new_code": """..."""  (GREEDY -- fixed)
-#   6    _try_regex_quoted_fields     Proper \" escaping but otherwise bad JSON
-#   7    _try_greedy_new_code_extract Unescaped " inside new_code value
-#   8    _try_markdown_code_blocks    Any fenced code block (any label)
-#   9    _try_plain_train_py          Raw train.py with no JSON wrapper at all
-
 
 def _strip_outer_markdown_fence(text: str) -> str:
     """If the entire reply is wrapped in one code fence, unwrap it."""
@@ -227,16 +203,9 @@ def _strip_outer_markdown_fence(text: str) -> str:
 
 
 def _looks_like_train_py(s: str) -> bool:
-    """
-    Returns True if s looks like a YOLO11 train.py source file.
-    FIX #7: old version had only 5 signals and was too strict.
-    Now uses 9 signals covering any reasonable refactoring.
-    The compile() call in _validate_train_py_source is the hard gate;
-    this check is intentionally permissive.
-    """
+    """Returns True if s looks like a YOLO11 train.py source file."""
     if not s or len(s.strip()) < 200:
         return False
-    # Require at least minimal Python structure
     has_python = (
         "\ndef " in s or s.startswith("def ")
         or '"""' in s or "'''" in s
@@ -258,10 +227,6 @@ def _looks_like_train_py(s: str) -> bool:
 
 
 def _unescape_json_string(s: str) -> str:
-    """
-    Decode a JSON string body (no surrounding quotes).
-    Falls back to manual substitution so callers always get a usable string.
-    """
     try:
         return json.loads('"' + s + '"')
     except (json.JSONDecodeError, ValueError):
@@ -274,26 +239,18 @@ def _unescape_json_string(s: str) -> str:
 
 
 def _smart_decode_code(raw: str) -> str:
-    """
-    Decide whether raw is JSON-escaped (\\n sequences) or literal (real newlines)
-    and decode accordingly, handling mixed content.
-    """
     if "\n" in raw:
-        # Already has real newlines -- only decode explicit escape sequences,
-        # not \\n (that would double-decode)
         return (
             raw.replace("\\t", "\t")
                .replace('\\"', '"')
                .replace("\\\\", "\\")
         )
-    # No real newlines present -- assume fully JSON-escaped
     return _unescape_json_string(raw)
 
 
 # -- Stage 1 ------------------------------------------------------------------
 
 def _try_json_raw_decode(text: str) -> dict | None:
-    """Parse first JSON object found (ignores any prose before the {)."""
     i = text.find("{")
     if i < 0:
         return None
@@ -313,7 +270,6 @@ def _try_json_raw_decode(text: str) -> dict | None:
 # -- Stage 2 ------------------------------------------------------------------
 
 def _try_json_loads_whole(text: str) -> dict | None:
-    """Parse entire text as JSON."""
     try:
         obj = json.loads(text)
     except (json.JSONDecodeError, TypeError):
@@ -330,14 +286,6 @@ def _try_json_loads_whole(text: str) -> dict | None:
 # -- Stage 3 pre-processor ----------------------------------------------------
 
 def _fix_json_literal_newlines(text: str) -> str:
-    """
-    FIX #2 (new): most common LLM mistake -- returning JSON where the new_code
-    value contains literal newline characters instead of the two-char escape \\n.
-
-    Scans only the new_code string value region and escapes bare newlines so
-    standard JSON parsers can then succeed.  Returns text unchanged if the
-    structure can't be found.
-    """
     start_m = re.search(r'"new_code"\s*:\s*"', text)
     if not start_m:
         return text
@@ -352,27 +300,25 @@ def _fix_json_literal_newlines(text: str) -> str:
     while i < len(rest):
         c = rest[i]
         if c == "\\" and i + 1 < len(rest):
-            # Already an escape sequence -- copy verbatim
             fixed.append(rest[i : i + 2])
             i += 2
         elif c == '"':
-            # Closing quote of the JSON string value
             fixed.append('"')
             i += 1
             closed = True
             break
         elif c == "\r" and i + 1 < len(rest) and rest[i + 1] == "\n":
-            fixed.append("\\n")   # CRLF -> \n escape
+            fixed.append("\\n")
             i += 2
         elif c in ("\n", "\r"):
-            fixed.append("\\n")   # bare newline -> \n escape
+            fixed.append("\\n")
             i += 1
         else:
             fixed.append(c)
             i += 1
 
     if not closed:
-        return text  # could not find closing quote; bail out unchanged
+        return text
 
     return prefix + "".join(fixed) + rest[i:]
 
@@ -380,11 +326,6 @@ def _fix_json_literal_newlines(text: str) -> str:
 # -- Stage 4 ------------------------------------------------------------------
 
 def _try_fenced_json_inner(text: str) -> dict | None:
-    """
-    Extract a ```json ... ``` block and run stages 1-3 on its inner content.
-    FIX #5: old version only tried two parsers; now tries all JSON parsers
-    including the literal-newline pre-processor.
-    """
     m = re.search(r"```(?:json)?\s*\r?\n(.*?)```", text, re.DOTALL | re.IGNORECASE)
     if not m:
         return None
@@ -412,15 +353,6 @@ def _try_fenced_json_inner(text: str) -> dict | None:
 # -- Stage 5 ------------------------------------------------------------------
 
 def _try_triple_quote_new_code(text: str) -> dict | None:
-    """
-    Handle: "new_code": \"\"\"...full file...\"\"\".
-
-    FIX #3 (critical): old non-greedy (.*?) stopped at the FIRST \"\"\" inside
-    the code, which is always the file-level docstring -- giving truncated code.
-
-    Fix: collect ALL \"\"\" positions after the opening, then pick the LAST one
-    that is followed by a JSON-closing character (} , or end-of-text).
-    """
     start_m = re.search(r'"new_code"\s*:\s*"""', text, re.DOTALL)
     if not start_m:
         return None
@@ -432,7 +364,6 @@ def _try_triple_quote_new_code(text: str) -> dict | None:
 
     new_code: str | None = None
 
-    # Prefer the LAST """ followed by JSON-closing pattern
     for pos in reversed(triple_positions):
         candidate = after_open[:pos]
         tail = after_open[pos + 3:].lstrip()
@@ -440,7 +371,6 @@ def _try_triple_quote_new_code(text: str) -> dict | None:
             new_code = candidate
             break
 
-    # Fallback: use the last """ regardless
     if new_code is None:
         new_code = after_open[: triple_positions[-1]]
 
@@ -462,10 +392,6 @@ def _try_triple_quote_new_code(text: str) -> dict | None:
 # -- Stage 6 ------------------------------------------------------------------
 
 def _try_regex_quoted_fields(text: str) -> dict | None:
-    """
-    Regex extraction when JSON is otherwise broken but values use proper \\\"
-    escaping.  Does NOT handle bare unescaped " inside values (stage 7 does).
-    """
     desc_m = re.search(r'"description"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
     code_m = re.search(r'"new_code"\s*:\s*"((?:[^"\\]|\\.)*)"', text, re.DOTALL)
     if not (desc_m and code_m):
@@ -480,12 +406,6 @@ def _try_regex_quoted_fields(text: str) -> dict | None:
 # -- Stage 7 ------------------------------------------------------------------
 
 def _try_greedy_new_code_extract(text: str) -> dict | None:
-    """
-    FIX #4 (new): handles the case where new_code contains unescaped double
-    quotes, e.g. f-strings or print("hello").  The regex in stage 6 stops at
-    the first unescaped "; we instead scan for the LAST quote followed by the
-    JSON object's closing brace to bound the content region.
-    """
     start_m = re.search(r'"new_code"\s*:\s*"', text)
     if not start_m:
         return None
@@ -498,13 +418,12 @@ def _try_greedy_new_code_extract(text: str) -> dict | None:
         else "LLM proposal (greedy)"
     )
 
-    # Try patterns from most specific to most permissive
     end_patterns = [
-        r'"\s*\n\s*\}\s*$',   # "...\n} at end-of-text
-        r'"\s*\}\s*$',         # "...} at end-of-text
-        r'"\s*\n\s*\}',        # "...\n} anywhere
-        r'"\s*\}',             # "...} anywhere
-        r'"\s*$',              # bare " at end
+        r'"\s*\n\s*\}\s*$',
+        r'"\s*\}\s*$',
+        r'"\s*\n\s*\}',
+        r'"\s*\}',
+        r'"\s*$',
     ]
 
     raw_code: str | None = None
@@ -532,15 +451,6 @@ def _try_greedy_new_code_extract(text: str) -> dict | None:
 # -- Stage 8 ------------------------------------------------------------------
 
 def _try_markdown_code_blocks(text: str) -> dict | None:
-    """
-    Find the best code block across ANY Markdown fence (any label or none).
-
-    FIX #6: old version only matched python/py labels; plain ``` or labels
-    like ```text / ```sh were missed by the second fallback pattern which
-    required a non-empty label.  Now we collect ALL fenced blocks regardless
-    of label and score them by content.
-    """
-    # All fenced blocks: ``` + optional label + newline + content + ```
     blocks = re.findall(r"```[^\n]*\n(.*?)```", text, re.DOTALL)
     if not blocks:
         blocks = re.findall(r"```[^\n]*(.*?)```", text, re.DOTALL)
@@ -565,13 +475,11 @@ def _try_markdown_code_blocks(text: str) -> dict | None:
 # -- Stage 9 ------------------------------------------------------------------
 
 def _try_plain_train_py(text: str) -> dict | None:
-    """Handle the case where the LLM returned raw Python with no JSON wrapper."""
     t = text.strip()
     if t.startswith("{") or t.startswith("["):
         return None
     if not _looks_like_train_py(t):
         return None
-    # Use the first meaningful line as description
     for line in t.splitlines():
         line = line.strip().lstrip("#").strip().strip('"').strip("'").strip()
         if line and len(line) > 5:
@@ -582,23 +490,15 @@ def _try_plain_train_py(text: str) -> dict | None:
 # ── Master parser dispatcher ──────────────────────────────────────────────────
 
 def _parse_llm_proposal(raw_text: str) -> dict:
-    """
-    Extract {"description": str, "new_code": str} from ANY LLM response.
-
-    Ten-stage waterfall -- stops at first success.
-    See module-level comment above the stage functions for the full table.
-    """
-    # Normalize Unicode in raw text and strip an outer code fence if present
+    """Extract {"description": str, "new_code": str} from ANY LLM response."""
     text = _normalize_llm_text(raw_text)
     text = _strip_outer_markdown_fence(text)
 
-    # Stages 1-2: strict JSON
     for fn in (_try_json_raw_decode, _try_json_loads_whole):
         out = fn(text)
         if out:
             return out
 
-    # Stage 3: fix literal \n then retry strict JSON
     fixed_nl = _fix_json_literal_newlines(text)
     if fixed_nl != text:
         for fn in (_try_json_raw_decode, _try_json_loads_whole):
@@ -606,7 +506,6 @@ def _parse_llm_proposal(raw_text: str) -> dict:
             if out:
                 return out
 
-    # Stages 4-7: structural / regex parsers on normalized text
     for fn in (
         _try_fenced_json_inner,
         _try_triple_quote_new_code,
@@ -617,8 +516,6 @@ def _parse_llm_proposal(raw_text: str) -> dict:
         if out:
             return out
 
-    # Stages 8-9: code-level parsers
-    # Try both the normalized and the raw-then-normalized versions to maximize hits
     raw_normalized = _normalize_llm_text(raw_text)
     for fn in (_try_markdown_code_blocks, _try_plain_train_py):
         out = fn(raw_normalized) or fn(text)
@@ -642,8 +539,6 @@ def propose_experiment(history: list[dict], current_code: str) -> dict:
 
     code_chars = len(current_code)
 
-    # FIX #9: system prompt rewritten to be explicit about JSON encoding,
-    # ASCII-only (not just in comments), config-section scope, and length.
     system_prompt = (
         "You are an expert computer vision researcher optimising YOLO11 "
         "fine-tuning on a small custom dataset.\n"
@@ -689,12 +584,6 @@ def propose_experiment(history: list[dict], current_code: str) -> dict:
 # ── Validation ────────────────────────────────────────────────────────────────
 
 def _validate_train_py_source(src: str) -> None:
-    """
-    Reject LLM output that is not syntactically valid Python.
-
-    FIX #10: old version showed only line number; now prints code context
-    (3 lines before, 2 after) around the error for easier debugging.
-    """
     s = src.lstrip("\ufeff \t\r\n")
     if not (s.startswith('"""') or s.startswith("'''")):
         raise ValueError(
@@ -750,6 +639,28 @@ def git_reset_last() -> None:
     )
 
 
+# ── Progress-line detection ───────────────────────────────────────────────────
+
+# Matches a YOLO/rich per-batch progress line, e.g.:
+#   "  1/1  3.8G  1.948 ...  78% ━━━━━─── 316/405 4.7it/s 1:24<19.3s"
+# Heuristic: line contains rich block characters OR the "NNN/MMM 4.7it/s"
+# step counter that appears on every batch update.
+_PROGRESS_RE = re.compile(
+    r"(?:[\u2501\u2578\u2579\u257a\u257b\u254b\u2503\u2500\u2580\u2584\u2588]"  # rich bar chars
+    r"|\b\d+/\d+\s+\d+\.\d+it/s"    # e.g. 316/405  4.7it/s
+    r"|\d+%\s*[|\u2500-\u259f])",    # e.g. 78% ━
+)
+
+# Width used to pad/clear the overwritten progress line
+_TERM_WIDTH = 120
+
+
+def _is_progress_line(line: str) -> bool:
+    """Return True for YOLO per-batch lines that should overwrite in place."""
+    stripped = line.strip()
+    return bool(stripped and _PROGRESS_RE.search(stripped))
+
+
 # ── Training & metrics ────────────────────────────────────────────────────────
 
 def _stream_process(
@@ -758,12 +669,18 @@ def _stream_process(
     timeout: float | None,
 ) -> tuple[bool, float]:
     """
-    Read process stdout LINE BY LINE so every YOLO progress line appears
-    in the terminal immediately.  Uses text-mode line iterator (not chunk reads)
-    so Kaggle notebooks see output in real time.
+    Read process stdout LINE BY LINE.
+
+    Batch-level progress lines (the ones YOLO emits hundreds of times per
+    epoch) are collapsed into a single terminal line overwritten in place
+    with \\r.  All other lines (epoch summaries, val metrics, etc.) are
+    printed normally so nothing important is lost.
+
+    Every line -- including progress noise -- is still written to run.log.
     """
     t0 = time.time()
-    timed_out = False
+    timed_out     = False
+    on_prog_line  = False   # True when the last terminal write used \\r
 
     def _watchdog():
         nonlocal timed_out
@@ -780,12 +697,30 @@ def _stream_process(
     assert proc.stdout is not None
     try:
         for line in proc.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
+            # Always write full line to log file
             log_f.write(line)
             log_f.flush()
+
+            if _is_progress_line(line):
+                # Overwrite the same terminal line in place
+                display = line.rstrip("\n\r")[:_TERM_WIDTH].ljust(_TERM_WIDTH)
+                sys.stdout.write("\r" + display)
+                sys.stdout.flush()
+                on_prog_line = True
+            else:
+                # Normal line -- move to a fresh line first if needed
+                if on_prog_line:
+                    sys.stdout.write("\n")
+                    on_prog_line = False
+                sys.stdout.write(line)
+                sys.stdout.flush()
     except BrokenPipeError:
         pass
+
+    # Ensure the cursor lands on a fresh line after the loop ends
+    if on_prog_line:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
     rc      = proc.wait()
     elapsed = time.time() - t0
