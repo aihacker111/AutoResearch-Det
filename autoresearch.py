@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -82,11 +83,13 @@ def detect_gpus() -> int:
 
 
 def build_cmd(num_gpus: int) -> list[str]:
+    """-u = unbuffered stdout/stderr (needed for live logs under tqdm / notebooks)."""
     train = str(_TRAIN_FILE)
+    py = sys.executable
     if num_gpus <= 1:
-        return [sys.executable, train]
+        return [py, "-u", train]
     return [
-        sys.executable, "-m", "torch.distributed.run",
+        py, "-u", "-m", "torch.distributed.run",
         f"--nproc_per_node={num_gpus}",
         "--master_port=29500",
         train,
@@ -217,37 +220,45 @@ def git_reset_last() -> None:
 
 # ── Training & metrics ────────────────────────────────────────────────────────
 
-def run_training(
-    num_gpus: int,
+def _run_training_unix_tee(
+    cmd: list[str],
     timeout: float | None,
-    *,
-    quiet: bool = False,
+    env: dict[str, str],
 ) -> tuple[bool, float]:
     """
-    Run train.py. By default streams stdout/stderr to the terminal and run.log.
-    Set quiet=True to only write run.log (no live output).
+    Linux/macOS/Kaggle: run through `tee` so output inherits the real TTY.
+    `torch.distributed` worker logs often do not show up when the parent uses
+    subprocess.PIPE (Jupyter then stays blank until the run ends).
     """
-    cmd = build_cmd(num_gpus)
-    t0  = time.time()
-    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    cmd_str = " ".join(shlex.quote(c) for c in cmd)
+    logf = shlex.quote(str(_LOG_FILE))
+    print("  ── training log (live; also saved to run.log) ──")
+    sys.stdout.flush()
+    bash_cmd = f"set -o pipefail && {cmd_str} 2>&1 | tee {logf}"
+    t0 = time.time()
+    try:
+        r = subprocess.run(
+            bash_cmd,
+            shell=True,
+            cwd=str(_ROOT),
+            env=env,
+            executable="/bin/bash",
+            timeout=timeout,
+        )
+        return r.returncode == 0, time.time() - t0
+    except subprocess.TimeoutExpired:
+        elapsed = time.time() - t0
+        print(f"\n  [TIMEOUT] killed after {elapsed:.0f}s")
+        return False, elapsed
 
-    if quiet:
-        try:
-            with open(_LOG_FILE, "w") as log_out:
-                proc = subprocess.run(
-                    cmd,
-                    cwd     = str(_ROOT),
-                    stdout  = log_out,
-                    stderr  = subprocess.STDOUT,
-                    timeout = timeout,
-                    env     = env,
-                )
-            return proc.returncode == 0, time.time() - t0
-        except subprocess.TimeoutExpired:
-            elapsed = time.time() - t0
-            print(f"  [TIMEOUT] killed after {elapsed:.0f}s")
-            return False, elapsed
 
+def _run_training_pipe_tee(
+    cmd: list[str],
+    timeout: float | None,
+    env: dict[str, str],
+) -> tuple[bool, float]:
+    """Windows fallback: copy pipe output to stdout and run.log."""
+    t0 = time.time()
     timed_out = False
     proc: subprocess.Popen | None = None
 
@@ -265,15 +276,14 @@ def run_training(
         sys.stdout.flush()
         proc = subprocess.Popen(
             cmd,
-            cwd     = str(_ROOT),
-            stdout  = subprocess.PIPE,
-            stderr  = subprocess.STDOUT,
-            text    = True,
-            bufsize = 0,
-            env     = env,
+            cwd=str(_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=0,
+            env=env,
         )
-        killer = threading.Thread(target=_kill_if_stale, daemon=True)
-        killer.start()
+        threading.Thread(target=_kill_if_stale, daemon=True).start()
         assert proc.stdout is not None
         try:
             while True:
@@ -292,6 +302,49 @@ def run_training(
             print(f"\n  [TIMEOUT] killed after {timeout:.0f}s")
             return False, elapsed
         return rc == 0, elapsed
+
+
+def run_training(
+    num_gpus: int,
+    timeout: float | None,
+    *,
+    quiet: bool = False,
+) -> tuple[bool, float]:
+    """
+    Run train.py. By default streams stdout/stderr to the terminal and run.log.
+    On Linux/macOS, uses `tee` so notebooks (e.g. Kaggle) show distributed logs live.
+    Set quiet=True to only write run.log (no live output).
+    """
+    cmd = build_cmd(num_gpus)
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+
+    if quiet:
+        t0 = time.time()
+        try:
+            with open(_LOG_FILE, "w") as log_out:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(_ROOT),
+                    stdout=log_out,
+                    stderr=subprocess.STDOUT,
+                    timeout=timeout,
+                    env=env,
+                )
+            return proc.returncode == 0, time.time() - t0
+        except subprocess.TimeoutExpired:
+            elapsed = time.time() - t0
+            print(f"  [TIMEOUT] killed after {elapsed:.0f}s")
+            return False, elapsed
+
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(line_buffering=True)
+        except (OSError, ValueError):
+            pass
+
+    if sys.platform != "win32" and os.path.isfile("/bin/bash"):
+        return _run_training_unix_tee(cmd, timeout, env)
+    return _run_training_pipe_tee(cmd, timeout, env)
 
 
 def parse_metrics() -> dict[str, float]:
