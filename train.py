@@ -61,6 +61,25 @@ import json, os, sys, time
 from pathlib import Path
 
 
+def _resolve_data_yaml() -> str:
+    """Resolve DATA_YAML relative to this file; optional DATA_YAML env override."""
+    raw = os.environ.get("DATA_YAML", DATA_YAML)
+    p = Path(raw)
+    if not p.is_absolute():
+        p = Path(__file__).resolve().parent / p
+    p = p.resolve()
+    if not p.is_file():
+        root = Path(__file__).resolve().parent
+        sys.exit(
+            f"ERROR: Dataset config not found: {p}\n"
+            "  Generate it from your dataset root, e.g.:\n"
+            f"    python prepare.py --dataset-dir $DATASET_DIR\n"
+            f"  (run inside {root} so data.yaml is created next to train.py)\n"
+            "  Or: export DATA_YAML=/path/to/your/data.yaml"
+        )
+    return str(p)
+
+
 def main():
     try:
         import torch
@@ -76,7 +95,7 @@ def main():
     t0 = time.time()
 
     results = model.train(
-        data            = DATA_YAML,
+        data            = _resolve_data_yaml(),
         epochs          = EPOCHS,
         patience        = PATIENCE,
         imgsz           = IMGSZ,

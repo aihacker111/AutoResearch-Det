@@ -50,7 +50,7 @@ _LLM_RETRIES    = 3
 _LLM_RETRY_WAIT = 5   # seconds between retries
 
 # Runtime globals
-OPENROUTER_API_KEY: str = "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"
+OPENROUTER_API_KEY: str = ""
 LLM_MODEL:          str = _DEFAULT_MODEL
 NUM_GPUS:           int = 2
 _shutdown_requested:bool = False
@@ -320,7 +320,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # ── Environment ----------------------------------------------------------
-    OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "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")
+    OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
     if not OPENROUTER_API_KEY:
         sys.exit("ERROR: set OPENROUTER_API_KEY environment variable")
 
