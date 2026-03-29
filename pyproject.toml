@@ -1,0 +1,30 @@
+[project]
+name        = "autoresearch-det"
+version     = "0.1.0"
+description = "Autonomous hyperparameter search for YOLO11 object detection"
+readme      = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "ultralytics>=8.3.0",   # YOLO11 + training loop
+    "torch>=2.2.0",
+    "torchvision>=0.17.0",
+    "numpy>=1.26.0",
+    "pyyaml>=6.0.1",
+    "matplotlib>=3.8.0",    # plot_progress.py
+    "opencv-python>=4.9.0",
+    "pillow>=10.0.0",
+    "scipy>=1.12.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0.0", "jupyter>=1.0.0"]
+
+[tool.uv]
+# Agents may ONLY use packages listed in [project.dependencies].
+# Do NOT install new packages during autoresearch.
+
+[build-system]
+requires      = ["hatchling"]
+build-backend = "hatchling.build"
