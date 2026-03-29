@@ -3,17 +3,25 @@ prepare.py — Fixed setup & evaluation harness.
 ===============================================
 AutoResearch-DET | DO NOT EDIT.
 
-Responsibilities
-----------------
-1. Resolve dataset directory → generate data.yaml
-2. Auto-detect classes; support YOLO flat, COCO JSON, Roboflow formats
-3. Evaluate a trained checkpoint and print metrics
+Supported dataset structures
+-----------------------------
+A) Roboflow / split-level COCO:
+   train/_annotations.coco.json  +  train/images/
+   valid/_annotations.coco.json  +  valid/images/
+
+B) Root-level COCO (e.g. VisDrone):
+   annotations_*_train.json  +  train/   (images directly inside)
+   annotations_*_val.json    +  val/
+
+C) YOLO flat (labels already converted):
+   images/train/  +  labels/train/
+   data.yaml or classes.txt
 
 Usage
 -----
     python prepare.py --dataset-dir /path/to/dataset
     python prepare.py --eval --weights output/train/exp/weights/best.pt
-    python prepare.py --verify          # check dataset integrity only
+    python prepare.py --verify
 """
 
 from __future__ import annotations
@@ -23,12 +31,13 @@ import json
 import os
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import yaml
 
 
-# ── Constants (used by train.py as well) ──────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
 EVAL_IMGSZ   = 640
 EVAL_BATCH   = 16
 EVAL_WORKERS = 4
@@ -36,12 +45,14 @@ EVAL_CONF    = 0.001
 EVAL_IOU     = 0.6
 
 
-# ── Class-name detection ──────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Class-name helpers
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _names_from_yaml(root: Path) -> dict | None:
     for p in [root / "data.yaml", root / "dataset.yaml", *root.glob("*.yaml")]:
         try:
-            cfg = yaml.safe_load(p.read_text())
+            cfg   = yaml.safe_load(p.read_text())
             names = cfg.get("names")
             if names is None:
                 continue
@@ -58,55 +69,97 @@ def _names_from_yaml(root: Path) -> dict | None:
     return None
 
 
-def _names_from_coco(root: Path) -> dict | None:
-    candidates = [
-        root / "train" / "_annotations.coco.json",
-        root / "valid" / "_annotations.coco.json",
-        root / "val"   / "_annotations.coco.json",
-        *(sorted((root / "annotations").glob("*.json"))
-          if (root / "annotations").is_dir() else []),
-        *sorted(root.glob("*.json")),
-    ]
-    for p in candidates:
-        if not p.is_file():
-            continue
-        try:
-            data  = json.loads(p.read_text())
-            cats  = sorted(data.get("categories", []), key=lambda c: int(c["id"]))
-            if cats:
-                return {i: c["name"] for i, c in enumerate(cats)}
-        except Exception:
-            continue
+def _names_from_json(json_path: Path) -> dict | None:
+    try:
+        data = json.loads(json_path.read_text())
+        cats = sorted(data.get("categories", []), key=lambda c: int(c["id"]))
+        if cats:
+            return {i: c["name"] for i, c in enumerate(cats)}
+    except Exception:
+        pass
     return None
 
 
-# ── COCO JSON → YOLO txt conversion ──────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Dataset structure detection
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def _convert_coco_split(json_path: Path, images_dir: Path, labels_dir: Path) -> None:
+def _has_images(p: Path) -> bool:
+    if not p.is_dir():
+        return False
+    return any(p.glob("*.jpg")) or any(p.glob("*.png")) or any(p.glob("*.jpeg"))
+
+
+def _find_images_dir(root: Path, split: str) -> Path | None:
+    """Resolve image directory for a split, trying multiple layout conventions."""
+    aliases = {"val": ["val", "valid"], "valid": ["val", "valid"]}.get(split, [split])
+    for alias in aliases:
+        for p in [
+            root / alias / "images",   # Roboflow: train/images/
+            root / "images" / alias,   # YOLO flat: images/train/
+            root / alias,              # VisDrone: train/ (images directly)
+        ]:
+            if _has_images(p):
+                return p
+    return None
+
+
+def _find_annotation_json(root: Path, split: str) -> Path | None:
     """
-    Convert a single COCO-format JSON split to YOLO .txt labels.
-    Uses ultralytics built-in if available, falls back to manual conversion.
+    Locate COCO JSON for a split.
+    Supports root-level naming (VisDrone) and split-folder naming (Roboflow).
     """
+    aliases = {"val": ["val", "valid"], "valid": ["val", "valid"]}.get(split, [split])
+    for alias in aliases:
+        candidates = [
+            # Root-level (VisDrone): annotations_VisDrone_train.json
+            *root.glob(f"annotations_*_{alias}.json"),
+            *root.glob(f"*_{alias}.json"),
+            root / f"annotations_{alias}.json",
+            # Standard COCO annotations folder
+            root / "annotations" / f"instances_{alias}.json",
+            root / "annotations" / f"{alias}.json",
+            # Roboflow split-folder
+            root / alias / "_annotations.coco.json",
+            root / alias / "annotations.json",
+        ]
+        for p in candidates:
+            if p.is_file():
+                return p
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COCO → YOLO label conversion
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _convert_coco_to_yolo(json_path: Path, labels_dir: Path) -> int:
+    """
+    Convert COCO JSON to YOLO .txt label files.
+    Tries ultralytics built-in first, falls back to manual conversion.
+    Returns number of label files written.
+    """
+    # ── Try ultralytics built-in ──────────────────────────────────────────────
     try:
         from ultralytics.data.converter import convert_coco
-        # ultralytics expects a directory containing the JSON file
         convert_coco(
             labels_dir  = str(json_path.parent),
-            save_dir    = str(labels_dir.parent),  # writes into <save_dir>/labels/
+            save_dir    = str(labels_dir.parent),
             use_segments= False,
             cls91to80   = False,
         )
-        return
+        written = len(list(labels_dir.glob("*.txt"))) if labels_dir.exists() else 0
+        if written > 0:
+            return written
     except Exception:
-        pass  # fallback below
+        pass
 
     # ── Manual fallback ───────────────────────────────────────────────────────
-    data     = json.loads(json_path.read_text())
-    cats     = sorted(data["categories"], key=lambda c: int(c["id"]))
-    id2idx   = {c["id"]: i for i, c in enumerate(cats)}
-    id2meta  = {img["id"]: img for img in data["images"]}
+    data    = json.loads(json_path.read_text())
+    cats    = sorted(data.get("categories", []), key=lambda c: int(c["id"]))
+    id2idx  = {c["id"]: i for i, c in enumerate(cats)}
+    id2meta = {img["id"]: img for img in data.get("images", [])}
 
-    from collections import defaultdict
     anns_by_image: dict = defaultdict(list)
     for ann in data.get("annotations", []):
         if ann.get("iscrowd", 0):
@@ -114,127 +167,168 @@ def _convert_coco_split(json_path: Path, images_dir: Path, labels_dir: Path) -> 
         anns_by_image[ann["image_id"]].append(ann)
 
     labels_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
     for img_id, anns in anns_by_image.items():
         meta = id2meta.get(img_id)
         if not meta:
             continue
-        W, H   = meta["width"], meta["height"]
-        stem   = Path(meta["file_name"]).stem
-        lines  = []
+        W, H  = meta["width"], meta["height"]
+        stem  = Path(meta["file_name"]).stem
+        lines = []
         for ann in anns:
             x, y, w, h = ann["bbox"]
-            cx = (x + w / 2) / W
-            cy = (y + h / 2) / H
-            nw = w / W
-            nh = h / H
+            if w <= 0 or h <= 0:
+                continue
+            cx  = (x + w / 2) / W
+            cy  = (y + h / 2) / H
+            nw  = w / W
+            nh  = h / H
             cls = id2idx.get(ann["category_id"], 0)
             lines.append(f"{cls} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
-        (labels_dir / f"{stem}.txt").write_text("\n".join(lines))
+        if lines:
+            (labels_dir / f"{stem}.txt").write_text("\n".join(lines))
+            written += 1
+
+    return written
 
 
-# ── Dataset resolution ────────────────────────────────────────────────────────
+def _labels_dir_for(root: Path, split: str, images_dir: Path) -> Path:
+    """
+    Derive the labels directory path from the images directory.
+    - train/images/ → train/labels/
+    - images/train/ → labels/train/
+    - train/        → labels/train/   (VisDrone style)
+    """
+    img_str = str(images_dir)
+    if "/images/" in img_str or img_str.endswith("/images"):
+        return Path(img_str.replace("/images", "/labels", 1))
+    # images are directly in split folder → put labels under root/labels/split
+    return root / "labels" / split
 
-def _find_images(root: Path, split: str) -> Path | None:
-    for p in [root / split / "images", root / "images" / split, root / split]:
-        if p.is_dir() and (list(p.glob("*.jpg")) or list(p.glob("*.png"))):
-            return p
-    return None
+
+def _ensure_yolo_labels(root: Path, split: str, images_dir: Path) -> Path | None:
+    """Convert COCO annotations to YOLO labels if not already done."""
+    labels_dir = _labels_dir_for(root, split, images_dir)
+
+    if labels_dir.exists() and len(list(labels_dir.glob("*.txt"))) > 0:
+        return labels_dir  # already converted
+
+    json_path = _find_annotation_json(root, split)
+    if json_path is None:
+        print(f"  [prepare] WARNING: no annotation JSON found for split '{split}'")
+        return None
+
+    print(f"[prepare] Converting '{split}': {json_path.name} → {labels_dir}")
+    n = _convert_coco_to_yolo(json_path, labels_dir)
+    print(f"          {n} label files written → {labels_dir}")
+    return labels_dir
 
 
-def _ensure_yolo_labels(root: Path, split: str) -> None:
-    """Auto-convert COCO JSON labels to YOLO .txt if labels/ is missing."""
-    images_dir = _find_images(root, split)
-    if images_dir is None:
-        return
-
-    # Labels expected at sibling path images/ → labels/
-    labels_dir = Path(str(images_dir).replace("images", "labels"))
-    if labels_dir.exists() and any(labels_dir.glob("*.txt")):
-        return  # already converted
-
-    # Find COCO JSON for this split
-    split_aliases = {"val": ["valid", "val"], "valid": ["valid", "val"]}.get(split, [split])
-    json_candidates = []
-    for alias in split_aliases:
-        json_candidates += [
-            root / alias / "_annotations.coco.json",
-            root / "annotations" / f"instances_{alias}.json",
-            root / "annotations" / f"{alias}.json",
-        ]
-    for jpath in json_candidates:
-        if jpath.is_file():
-            print(f"[prepare] Converting COCO JSON → YOLO labels: {jpath}")
-            _convert_coco_split(jpath, images_dir, labels_dir)
-            return
-
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main: build data.yaml
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def build_data_yaml(dataset_dir: str, output: str = "data.yaml") -> dict:
     root = Path(dataset_dir).resolve()
     assert root.exists(), f"Dataset not found: {root}"
 
-    class_map = _names_from_yaml(root) or _names_from_coco(root)
+    # ── Detect class names ────────────────────────────────────────────────────
+    class_map = _names_from_yaml(root)
+    if class_map is None:
+        for split in ("train", "val", "valid"):
+            jp = _find_annotation_json(root, split)
+            if jp:
+                class_map = _names_from_json(jp)
+                if class_map:
+                    break
     if class_map is None:
         raise FileNotFoundError(
             f"Cannot find class names in {root}.\n"
-            "Expected: data.yaml, classes.txt, or *_annotations.coco.json"
+            "Expected: data.yaml, classes.txt, annotations_*_train.json, "
+            "or train/_annotations.coco.json"
         )
-
-    # Auto-convert COCO labels for each split
-    for split in ("train", "valid", "val", "test"):
-        _ensure_yolo_labels(root, split)
 
     nc    = len(class_map)
     names = [class_map[i] for i in range(nc)]
 
-    train_path = _find_images(root, "train")
-    val_path   = _find_images(root, "valid") or _find_images(root, "val")
-    test_path  = _find_images(root, "test")
+    # ── Resolve image directories ─────────────────────────────────────────────
+    train_imgs = _find_images_dir(root, "train")
+    val_imgs   = _find_images_dir(root, "val")
+    test_imgs  = _find_images_dir(root, "test") or _find_images_dir(root, "test-dev")
 
-    assert train_path, f"Cannot find train images under {root}"
-    assert val_path,   f"Cannot find val/valid images under {root}"
+    assert train_imgs, f"Cannot find train images under {root}"
+    assert val_imgs,   f"Cannot find val images under {root}"
 
+    # ── Convert COCO → YOLO labels for each split ─────────────────────────────
+    _ensure_yolo_labels(root, "train", train_imgs)
+    _ensure_yolo_labels(root, "val",   val_imgs)
+    if test_imgs:
+        _ensure_yolo_labels(root, "test", test_imgs)
+
+    # ── Write data.yaml ───────────────────────────────────────────────────────
     cfg: dict = {
         "path" : str(root),
-        "train": str(train_path),
-        "val"  : str(val_path),
+        "train": str(train_imgs),
+        "val"  : str(val_imgs),
         "nc"   : nc,
         "names": names,
     }
-    if test_path:
-        cfg["test"] = str(test_path)
+    if test_imgs:
+        cfg["test"] = str(test_imgs)
 
     Path(output).write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False))
-    print(f"[prepare] data.yaml → {output}")
-    print(f"          nc={nc}  classes={names[:5]}{'...' if nc > 5 else ''}")
-    print(f"          train={train_path}  val={val_path}")
+    print(f"\n[prepare] data.yaml → {output}")
+    print(f"          nc={nc}  classes={names[:6]}{'...' if nc > 6 else ''}")
+    print(f"          train : {train_imgs}")
+    print(f"          val   : {val_imgs}")
+    if test_imgs:
+        print(f"          test  : {test_imgs}")
     return cfg
 
 
-# ── Dataset verification ──────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Dataset verification
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def verify_dataset(data_yaml: str = "data.yaml") -> bool:
-    """Sanity-check that images/labels are paired and non-empty."""
-    cfg   = yaml.safe_load(Path(data_yaml).read_text())
-    ok    = True
-    root  = Path(cfg.get("path", "."))
+    cfg  = yaml.safe_load(Path(data_yaml).read_text())
+    root = Path(cfg.get("path", "."))
+    ok   = True
+
+    print("\n[verify] Checking dataset integrity…")
     for split in ("train", "val"):
         img_dir = Path(cfg.get(split, ""))
         if not img_dir.is_absolute():
             img_dir = root / img_dir
-        lbl_dir = Path(str(img_dir).replace("images", "labels"))
-        imgs    = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png"))
+
+        imgs = (list(img_dir.glob("*.jpg")) +
+                list(img_dir.glob("*.jpeg")) +
+                list(img_dir.glob("*.png")))
+
+        lbl_dir = _labels_dir_for(root, split, img_dir)
         lbls    = list(lbl_dir.glob("*.txt")) if lbl_dir.exists() else []
-        print(f"[verify] {split}: {len(imgs)} images, {len(lbls)} labels  ({img_dir})")
-        if len(imgs) == 0:
-            print(f"  WARNING: no images found in {img_dir}")
+
+        status = "✓" if (imgs and lbls) else "✗"
+        rel    = img_dir.relative_to(root) if img_dir.is_relative_to(root) else img_dir
+        print(f"  {status}  {split:5s}: {len(imgs):5d} images | {len(lbls):5d} labels  ({rel})")
+
+        if not imgs:
+            print(f"     WARNING: no images found in {img_dir}")
             ok = False
-        if len(lbls) == 0:
-            print(f"  WARNING: no labels found in {lbl_dir}")
+        if not lbls:
+            print(f"     WARNING: no labels found in {lbl_dir}")
+            print(f"     Hint: run  python prepare.py --dataset-dir {root}")
             ok = False
+        elif abs(len(imgs) - len(lbls)) > 5:
+            print(f"     WARNING: image/label count mismatch ({len(imgs)} vs {len(lbls)})")
+
+    print(f"\n  {'[OK] Dataset looks good.' if ok else '[FAIL] Fix warnings above before training.'}")
     return ok
 
 
-# ── Evaluation ────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Evaluation
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def evaluate(weights: str, data_yaml: str = "data.yaml") -> dict:
     try:
@@ -273,7 +367,9 @@ def evaluate(weights: str, data_yaml: str = "data.yaml") -> dict:
     return {"val_mAP5095": map5095, "val_mAP50": map50, "peak_vram_mb": peak_vram}
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     parser = argparse.ArgumentParser(description="AutoResearch-DET setup & eval")
@@ -282,7 +378,7 @@ def main():
     parser.add_argument("--eval",        action="store_true")
     parser.add_argument("--weights",     default="")
     parser.add_argument("--verify",      action="store_true",
-                        help="Verify dataset integrity only")
+                        help="Check dataset integrity only")
     args = parser.parse_args()
 
     if args.verify:
