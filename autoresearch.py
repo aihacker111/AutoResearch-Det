@@ -129,22 +129,200 @@ def _call_api_with_retry(messages: list[dict], max_tokens: int = 3000) -> str:
     raise RuntimeError(f"LLM API failed after {_LLM_RETRIES} attempts: {last_exc}")
 
 
-def _parse_json(text: str) -> dict:
-    """Parse JSON from LLM response, stripping markdown fences."""
-    text = re.sub(r"```(?:json|python)?\s*", "", text)
-    text = re.sub(r"```\s*",                  "", text)
-    text = text.encode("utf-8", errors="replace").decode("utf-8")
+def _normalize_llm_text(text: str) -> str:
+    t = text.strip()
+    if t.startswith("\ufeff"):
+        t = t[1:]
+    for a, b in (
+        ("\u201c", '"'),
+        ("\u201d", '"'),
+        ("\u2018", "'"),
+        ("\u2019", "'"),
+    ):
+        t = t.replace(a, b)
+    return t.encode("utf-8", errors="replace").decode("utf-8")
+
+
+def _strip_outer_markdown_fence(text: str) -> str:
+    """If the whole reply is one ```json / ```python block, return inner text."""
+    t = text.strip()
+    m = re.match(r"^```(?:json|python|py)?\s*\r?\n(.*)\r?\n```\s*$", t, re.DOTALL | re.IGNORECASE)
+    return m.group(1).strip() if m else t
+
+
+def _looks_like_train_py(s: str) -> bool:
+    if not s or len(s.strip()) < 80:
+        return False
+    head = s[:4000]
+    return (
+        "train.py" in head
+        or "MODEL_SIZE" in head
+        or ("def main" in s and "YOLO" in s)
+        or "ultralytics" in head
+        or ("model.train(" in s and "EPOCHS" in head)
+    )
+
+
+def _try_json_raw_decode(text: str) -> dict | None:
+    """Parse first JSON object in text (ignores prose before/after)."""
+    i = text.find("{")
+    if i < 0:
+        return None
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        desc = re.search(r'"description"\s*:\s*"([^"]+)"',    text)
-        code = re.search(r'"new_code"\s*:\s*"(.*?)"\s*[,}]', text, re.DOTALL)
-        if not (desc and code):
-            raise ValueError(f"Cannot parse LLM JSON:\n{text[:300]}")
-        return {
-            "description": desc.group(1),
-            "new_code"   : code.group(1).replace("\\n", "\n").replace('\\"', '"'),
-        }
+        obj, _ = json.JSONDecoder().raw_decode(text, i)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(obj, dict) or "new_code" not in obj:
+        return None
+    nc = obj["new_code"]
+    if nc is None or (isinstance(nc, str) and not nc.strip()):
+        return None
+    desc = obj.get("description") or "LLM proposal"
+    return {"description": str(desc).strip(), "new_code": str(nc)}
+
+
+def _try_json_loads_whole(text: str) -> dict | None:
+    try:
+        obj = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(obj, dict) or "new_code" not in obj:
+        return None
+    nc = obj["new_code"]
+    if nc is None or (isinstance(nc, str) and not str(nc).strip()):
+        return None
+    desc = obj.get("description") or "LLM proposal"
+    return {"description": str(desc).strip(), "new_code": str(nc)}
+
+
+def _try_triple_quote_new_code(text: str) -> dict | None:
+    tri = re.search(r'"new_code"\s*:\s*"""(.*?)"""', text, re.DOTALL)
+    if not tri:
+        return None
+    new_code = tri.group(1).strip()
+    desc_m = re.search(r'"description"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+    if not desc_m:
+        desc_m = re.search(r'"description"\s*:\s*"([^"]*)"', text)
+    if not desc_m:
+        return {"description": "LLM proposal (triple-quoted new_code)", "new_code": new_code}
+    desc = desc_m.group(1).replace("\\n", "\n").replace('\\"', '"')
+    return {"description": desc, "new_code": new_code}
+
+
+def _unescape_json_string(s: str) -> str:
+    """Decode a JSON string body (without outer quotes). Fallback on failure."""
+    try:
+        return json.loads('"' + s + '"')
+    except (json.JSONDecodeError, ValueError):
+        return (
+            s.replace("\\n", "\n")
+            .replace("\\t", "\t")
+            .replace('\\"', '"')
+            .replace("\\\\", "\\")
+        )
+
+
+def _try_regex_quoted_fields(text: str) -> dict | None:
+    desc = re.search(r'"description"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+    code = re.search(r'"new_code"\s*:\s*"((?:[^"\\]|\\.)*)"', text, re.DOTALL)
+    if not (desc and code):
+        return None
+    body = _unescape_json_string(code.group(1))
+    d = _unescape_json_string(desc.group(1))
+    if not body.strip():
+        return None
+    return {"description": d, "new_code": body}
+
+
+def _try_fenced_json_inner(text: str) -> dict | None:
+    """Parse first ```json ... ``` block as JSON (may contain extra keys)."""
+    m = re.search(r"```(?:json)?\s*\r?\n(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if not m:
+        return None
+    inner = m.group(1).strip()
+    return _try_json_raw_decode(inner) or _try_json_loads_whole(inner)
+
+
+def _try_markdown_code_blocks(text: str) -> dict | None:
+    blocks = re.findall(
+        r"```(?:python|py)?\s*\r?\n(.*?)```",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    # Also ```python ... ``` without newline after fence
+    if not blocks:
+        blocks = re.findall(
+            r"```(?:python|py)\s+(.*?)```",
+            text,
+            re.DOTALL | re.IGNORECASE,
+        )
+    best: str | None = None
+    for b in blocks:
+        b = b.strip()
+        if _looks_like_train_py(b) and (best is None or len(b) > len(best)):
+            best = b
+    if best:
+        m = re.search(
+            r"(?:description|change|summary)\s*[:#]\s*(.+?)(?:\n|$)",
+            text,
+            re.IGNORECASE,
+        )
+        desc = m.group(1).strip() if m else "LLM proposal (markdown code block)"
+        return {"description": desc[:200], "new_code": best}
+    return None
+
+
+def _try_plain_train_py(text: str) -> dict | None:
+    t = text.strip()
+    if t.startswith("{") or t.startswith("["):
+        return None
+    if _looks_like_train_py(t):
+        line = t.splitlines()[0].strip("# ")[:120]
+        desc = line if line else "LLM returned raw train.py"
+        return {"description": desc, "new_code": t}
+    return None
+
+
+def _parse_llm_proposal(text: str) -> dict:
+    """
+    Extract {"description", "new_code"} from arbitrary LLM output.
+    Tries strict JSON first, then common malformed patterns, then markdown / raw code.
+    """
+    raw = text
+    text = _normalize_llm_text(text)
+    text = _strip_outer_markdown_fence(text)
+
+    for fn in (
+        _try_json_raw_decode,
+        _try_json_loads_whole,
+        _try_fenced_json_inner,
+        _try_triple_quote_new_code,
+        _try_regex_quoted_fields,
+    ):
+        out = fn(text)
+        if out:
+            return out
+
+    text2 = _normalize_llm_text(raw)
+    out = _try_markdown_code_blocks(text2)
+    if out:
+        return out
+    out = _try_markdown_code_blocks(text)
+    if out:
+        return out
+
+    out = _try_plain_train_py(text2)
+    if out:
+        return out
+
+    out = _try_plain_train_py(text)
+    if out:
+        return out
+
+    raise ValueError(
+        "Cannot parse LLM response (no JSON with new_code, no train.py-like code block).\n"
+        f"First 500 chars:\n{text2[:500]}"
+    )
 
 
 def propose_experiment(history: list[dict], current_code: str) -> dict:
@@ -162,9 +340,11 @@ def propose_experiment(history: list[dict], current_code: str) -> dict:
                 "fine-tuning on a small custom dataset. "
                 "Your goal is to maximise val/mAP50-95. "
                 f"Training runs on {NUM_GPUS} GPU(s). "
-                "Reply ONLY with a single JSON object — "
-                '{"description": "one-line summary", "new_code": "full train.py content"}. '
-                "No markdown, no explanation outside the JSON."
+                "Reply ONLY with a single JSON object: "
+                '{"description": "one-line summary", "new_code": "<entire train.py as one JSON string>"}. '
+                "new_code MUST be valid JSON: escape every newline inside the string as \\n "
+                'and quotes as \\". Do NOT use Python triple quotes \"\"\" around new_code. '
+                "No markdown fences, no text outside the JSON object."
             ),
         },
         {
@@ -180,7 +360,7 @@ def propose_experiment(history: list[dict], current_code: str) -> dict:
             ),
         },
     ]
-    return _parse_json(_call_api_with_retry(messages))
+    return _parse_llm_proposal(_call_api_with_retry(messages))
 
 
 # ── Git helpers ───────────────────────────────────────────────────────────────
