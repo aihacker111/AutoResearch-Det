@@ -13,6 +13,7 @@ Usage
     python run_autoresearch.py --experiments 10 --cuda-devices 0,1
     python run_autoresearch.py --resume          # continue from last run
     python run_autoresearch.py --dry-run         # LLM proposals only, no training
+    python run_autoresearch.py --quiet           # training logs only in run.log (no live print)
 
 Environment variables
 ---------------------
@@ -30,6 +31,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -215,22 +217,81 @@ def git_reset_last() -> None:
 
 # ── Training & metrics ────────────────────────────────────────────────────────
 
-def run_training(num_gpus: int, timeout: float | None) -> tuple[bool, float]:
+def run_training(
+    num_gpus: int,
+    timeout: float | None,
+    *,
+    quiet: bool = False,
+) -> tuple[bool, float]:
+    """
+    Run train.py. By default streams stdout/stderr to the terminal and run.log.
+    Set quiet=True to only write run.log (no live output).
+    """
     cmd = build_cmd(num_gpus)
     t0  = time.time()
-    try:
-        proc = subprocess.run(
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+
+    if quiet:
+        try:
+            with open(_LOG_FILE, "w") as log_out:
+                proc = subprocess.run(
+                    cmd,
+                    cwd     = str(_ROOT),
+                    stdout  = log_out,
+                    stderr  = subprocess.STDOUT,
+                    timeout = timeout,
+                    env     = env,
+                )
+            return proc.returncode == 0, time.time() - t0
+        except subprocess.TimeoutExpired:
+            elapsed = time.time() - t0
+            print(f"  [TIMEOUT] killed after {elapsed:.0f}s")
+            return False, elapsed
+
+    timed_out = False
+    proc: subprocess.Popen | None = None
+
+    def _kill_if_stale() -> None:
+        nonlocal timed_out, proc
+        if timeout is None or timeout <= 0:
+            return
+        time.sleep(timeout)
+        if proc is not None and proc.poll() is None:
+            timed_out = True
+            proc.kill()
+
+    with open(_LOG_FILE, "w") as log_f:
+        print("  ── training log (live; also saved to run.log) ──")
+        sys.stdout.flush()
+        proc = subprocess.Popen(
             cmd,
             cwd     = str(_ROOT),
-            stdout  = open(_LOG_FILE, "w"),
+            stdout  = subprocess.PIPE,
             stderr  = subprocess.STDOUT,
-            timeout = timeout,
+            text    = True,
+            bufsize = 0,
+            env     = env,
         )
-        return proc.returncode == 0, time.time() - t0
-    except subprocess.TimeoutExpired:
+        killer = threading.Thread(target=_kill_if_stale, daemon=True)
+        killer.start()
+        assert proc.stdout is not None
+        try:
+            while True:
+                chunk = proc.stdout.read(4096)
+                if not chunk:
+                    break
+                sys.stdout.write(chunk)
+                sys.stdout.flush()
+                log_f.write(chunk)
+                log_f.flush()
+        except BrokenPipeError:
+            pass
+        rc = proc.wait()
         elapsed = time.time() - t0
-        print(f"  [TIMEOUT] killed after {elapsed:.0f}s")
-        return False, elapsed
+        if timed_out and timeout is not None:
+            print(f"\n  [TIMEOUT] killed after {timeout:.0f}s")
+            return False, elapsed
+        return rc == 0, elapsed
 
 
 def parse_metrics() -> dict[str, float]:
@@ -317,6 +378,8 @@ def main() -> None:
                         help="Continue from existing results.tsv")
     parser.add_argument("--dry-run",      action="store_true",
                         help="Propose experiments without training")
+    parser.add_argument("--quiet",        action="store_true",
+                        help="Do not print training logs to the terminal (still write run.log)")
     args = parser.parse_args()
 
     # ── Environment ----------------------------------------------------------
@@ -373,6 +436,8 @@ def main() -> None:
     print(f"  Experiments : {remaining} remaining / {args.experiments} total")
     if args.dry_run:
         print(f"  Mode        : DRY-RUN (no training)")
+    if args.quiet:
+        print(f"  Training log: quiet (see {_LOG_FILE})")
     print(f"{'='*62}\n")
 
     for exp_num in range(completed + 1, args.experiments + 1):
@@ -413,7 +478,7 @@ def main() -> None:
 
         # ── Train -----------------------------------------------------------
         print("  Training…")
-        success, elapsed = run_training(NUM_GPUS, timeout)
+        success, elapsed = run_training(NUM_GPUS, timeout, quiet=args.quiet)
         if exp_num == 1:
             baseline_time = elapsed
 

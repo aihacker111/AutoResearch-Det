@@ -16,7 +16,7 @@ PRETRAINED = True       # start from COCO pretrained weights
 DATA_YAML  = "data.yaml"
 
 # ── Training schedule ─────────────────────────────────────────────────────────
-EPOCHS        = 50          # ↑ from 30 — small datasets benefit from more epochs
+EPOCHS        = 2
 PATIENCE      = 15          # ↑ slightly more tolerance
 IMGSZ         = 640
 CLOSE_MOSAIC  = 15          # ↑ disable mosaic earlier for small-data stability
