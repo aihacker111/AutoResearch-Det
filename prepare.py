@@ -39,6 +39,17 @@ from pathlib import Path
 import yaml
 
 
+_ROOT = Path(__file__).resolve().parent
+
+
+def _resolve_output_path(output: str) -> str:
+    """Relative paths are anchored to prepare.py's directory (same as train.py / data.yaml)."""
+    p = Path(output)
+    if p.is_absolute():
+        return str(p.resolve())
+    return str((_ROOT / p).resolve())
+
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 EVAL_IMGSZ   = 640
 EVAL_BATCH   = 16
@@ -371,7 +382,16 @@ def build_data_yaml(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def verify_dataset(data_yaml: str = "data.yaml") -> bool:
-    cfg  = yaml.safe_load(Path(data_yaml).read_text())
+    p = Path(data_yaml)
+    if not p.is_file():
+        print(
+            f"\n[verify] ERROR: file not found: {p}\n"
+            f"  Expected default: {_ROOT / 'data.yaml'}\n"
+            "  Pass --output /path/to/data.yaml or run from the project directory.",
+            file=sys.stderr,
+        )
+        return False
+    cfg  = yaml.safe_load(p.read_text())
     root = Path(cfg.get("path", "."))
     ok   = True
 
@@ -472,17 +492,19 @@ def main():
         if not out.is_absolute():
             args.output = str(Path(staging) / out.name)
 
+    output_resolved = _resolve_output_path(args.output)
+
     if args.verify:
-        ok = verify_dataset(args.output)
+        ok = verify_dataset(output_resolved)
         sys.exit(0 if ok else 1)
     elif args.eval:
         assert args.weights, "Pass --weights /path/to/best.pt"
-        evaluate(args.weights, args.output)
+        evaluate(args.weights, output_resolved)
     else:
         assert args.dataset_dir, "Pass --dataset-dir or set DATASET_DIR"
         build_data_yaml(
             args.dataset_dir,
-            args.output,
+            output_resolved,
             staging_dir=staging or None,
         )
 
