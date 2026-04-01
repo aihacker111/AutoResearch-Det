@@ -1,8 +1,0 @@
-commit	val_mAP5095	val_mAP50	memory_gb	status	description
-a1b2c3d	0.0520	0.0950	2.1	keep	baseline -- default hyperparameters
-d4e5f6a	0.0485	0.0880	2.2	discard	Raise LR0 to 2e-3 for faster convergence
-7b8c9d0	0.0610	0.1100	2.4	keep	Stronger mosaic 1.0 and mixup 0.1
-e1f2a3b	0.0595	0.1050	2.3	discard	AdamW weight decay 5e-4
-c5d6e7f	0.0635	0.1120	2.5	keep	Close mosaic at epoch 10 earlier for small dataset
-b9a8c7d	0.0620	0.1090	2.4	discard	Increase imgsz to 832
-f1e2d3c	0.0580	0.1020	2.1	crash	Label smoothing 0.1 run OOM on batch
