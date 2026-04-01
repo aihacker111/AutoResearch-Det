@@ -3,7 +3,6 @@ import json
 import os
 import shutil
 import sys
-import time
 from collections import defaultdict
 from pathlib import Path
 import yaml
@@ -70,7 +69,6 @@ def _convert_coco_to_yolo(json_path: Path, labels_dir: Path) -> int:
         if not ann.get("iscrowd", 0) and ann["category_id"] in id2idx:
             anns_by_image[ann["image_id"]].append(ann)
 
-    labels_dir.mkdir(parents=True, exist_ok=True)
     written = 0
     for img_id, anns in anns_by_image.items():
         meta = id2meta.get(img_id)
@@ -90,48 +88,62 @@ def _convert_coco_to_yolo(json_path: Path, labels_dir: Path) -> int:
             written += 1
     return written
 
-def _rel_under_root(base: Path, p: Path) -> str:
-    base, p = base.resolve(), p.resolve()
-    try: return str(p.relative_to(base))
-    except ValueError: return str(p)
+def _stage_split(src_images: Path, root: Path, split: str, prepared_dir: Path) -> bool:
+    """Safely stages images into images/{split} and converts/moves labels into labels/{split}."""
+    if not src_images: return False
 
-def _stage_images_into(src_images: Path, staging_root: Path, split: str) -> Path:
-    dst = staging_root / "images" / split
-    dst.mkdir(parents=True, exist_ok=True)
+    img_dst = prepared_dir / "images" / split
+    lbl_dst = prepared_dir / "labels" / split
+    img_dst.mkdir(parents=True, exist_ok=True)
+    lbl_dst.mkdir(parents=True, exist_ok=True)
+
+    print(f"  [{split}] Staging images -> {img_dst}")
+    img_count = 0
     for ext in ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG"):
-        for src in sorted(src_images.glob(ext)):
-            out = dst / src.name
-            if out.exists(): continue
-            try: out.symlink_to(src.resolve())
-            except OSError: shutil.copy2(src, out)
-    return dst
+        for img in src_images.glob(ext):
+            dest = img_dst / img.name
+            if not dest.exists():
+                try: dest.symlink_to(img.resolve())
+                except OSError: shutil.copy2(img, dest)
+            img_count += 1
 
-def _labels_dir_for(root: Path, split: str, images_dir: Path) -> Path:
-    img_str = str(images_dir.resolve())
-    if "/images/" in img_str or img_str.endswith("/images"): return Path(img_str.replace("/images", "/labels", 1))
-    
-    roboflow_split = root / split / "images"
-    try:
-        if images_dir.resolve() == roboflow_split.resolve(): return root / split / "labels"
-    except OSError: pass
-
-    default = root / "labels" / split
-    try:
-        test_file = root / ".write_test_prepare"
-        test_file.touch(); test_file.unlink()
-        return default
-    except (OSError, PermissionError): return Path(os.environ.get("LABELS_DIR", "labels")) / root.name / split
-
-def _ensure_yolo_labels(root: Path, split: str, images_dir: Path) -> Path | None:
-    labels_dir = _labels_dir_for(root, split, images_dir)
-    if labels_dir.exists() and len(list(labels_dir.glob("*.txt"))) > 0: return labels_dir
+    # Look for COCO json to convert
     json_path = _find_annotation_json(root, split)
-    if not json_path: return None
-    _convert_coco_to_yolo(json_path, labels_dir)
-    return labels_dir
+    if json_path:
+        print(f"  [{split}] Converting COCO JSON -> {lbl_dst}")
+        lbl_count = _convert_coco_to_yolo(json_path, lbl_dst)
+    else:
+        # Fallback: Maybe it's already YOLO format? Try to find existing txt labels
+        existing_labels_dir = None
+        img_str = str(src_images.resolve())
+        if "/images/" in img_str or img_str.endswith("/images"):
+            existing_labels_dir = Path(img_str.replace("/images", "/labels", 1))
+        elif (root / split / "labels").exists():
+            existing_labels_dir = root / split / "labels"
 
-def build_data_yaml(dataset_dir: str, output: str = "data.yaml", staging_dir: str | None = None) -> dict:
+        lbl_count = 0
+        if existing_labels_dir and existing_labels_dir.exists():
+            print(f"  [{split}] Copying YOLO labels -> {lbl_dst}")
+            for txt in existing_labels_dir.glob("*.txt"):
+                dest = lbl_dst / txt.name
+                if not dest.exists():
+                    try: dest.symlink_to(txt.resolve())
+                    except OSError: shutil.copy2(txt, dest)
+                lbl_count += 1
+
+    print(f"  [{split}] Done: {img_count} images, {lbl_count} labels.")
+    return True
+
+def build_data_yaml(dataset_dir: str, output: str = "data.yaml") -> dict:
     root = Path(dataset_dir).resolve()
+    out_yaml = Path(output).resolve()
+    
+    # Force unified YOLO output directory right next to the generated data.yaml
+    prepared_dir = out_yaml.parent / "yolo_dataset"
+    prepared_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n[prepare] Building unified YOLO dataset at: {prepared_dir}")
+
     class_map = _names_from_yaml(root)
     if not class_map:
         for split in ("train", "val", "valid"):
@@ -140,6 +152,9 @@ def build_data_yaml(dataset_dir: str, output: str = "data.yaml", staging_dir: st
                 class_map = _names_from_json(jp)
                 if class_map: break
     
+    if not class_map:
+        sys.exit(f"ERROR: Cannot find class names in {root}.")
+
     nc = len(class_map)
     names = [class_map[i] for i in range(nc)]
 
@@ -147,24 +162,31 @@ def build_data_yaml(dataset_dir: str, output: str = "data.yaml", staging_dir: st
     val_imgs = _find_images_dir(root, "val")
     test_imgs = _find_images_dir(root, "test") or _find_images_dir(root, "test-dev")
 
-    yaml_root = root
-    if staging_dir:
-        yaml_root = Path(staging_dir).resolve()
-        yaml_root.mkdir(parents=True, exist_ok=True)
-        train_imgs = _stage_images_into(train_imgs, yaml_root, "train")
-        val_imgs = _stage_images_into(val_imgs, yaml_root, "val")
-        if test_imgs: test_imgs = _stage_images_into(test_imgs, yaml_root, "test")
+    if not train_imgs or not val_imgs:
+        sys.exit(f"ERROR: Could not find train or val image directories in {root}")
 
-    _ensure_yolo_labels(root, "train", train_imgs)
-    _ensure_yolo_labels(root, "val", val_imgs)
-    if test_imgs: _ensure_yolo_labels(root, "test", test_imgs)
+    # Stage data into strict YOLO layout
+    _stage_split(train_imgs, root, "train", prepared_dir)
+    _stage_split(val_imgs, root, "val", prepared_dir)
+    if test_imgs:
+        _stage_split(test_imgs, root, "test", prepared_dir)
 
-    cfg = {"path": str(yaml_root), "train": _rel_under_root(yaml_root, train_imgs), "val": _rel_under_root(yaml_root, val_imgs), "nc": nc, "names": names}
-    if test_imgs: cfg["test"] = _rel_under_root(yaml_root, test_imgs)
+    # YOLO requires paths to be relative to the data.yaml directory OR absolute
+    # By making them absolute, we guarantee YOLO never gets confused.
+    cfg = {
+        "path": str(prepared_dir),
+        "train": "images/train",
+        "val": "images/val",
+        "nc": nc,
+        "names": names
+    }
+    if test_imgs: 
+        cfg["test"] = "images/test"
 
-    out_path = Path(output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False))
+    out_yaml.parent.mkdir(parents=True, exist_ok=True)
+    out_yaml.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False))
+    
+    print(f"\n[prepare] Successfully wrote {out_yaml}")
     return cfg
 
 def verify_dataset(data_yaml: str = "data.yaml") -> bool:
@@ -174,43 +196,35 @@ def verify_dataset(data_yaml: str = "data.yaml") -> bool:
     root = Path(cfg.get("path", "."))
     ok = True
 
+    print(f"\n[verify] Checking dataset integrity at {root}...")
     for split in ("train", "val"):
-        img_dir = Path(cfg.get(split, ""))
-        if not img_dir.is_absolute(): img_dir = root / img_dir
+        img_dir = root / cfg.get(split, f"images/{split}")
+        lbl_dir = root / f"labels/{split}"
+        
         imgs = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.jpeg")) + list(img_dir.glob("*.png"))
-        lbl_dir = _labels_dir_for(root, split, img_dir)
         lbls = list(lbl_dir.glob("*.txt")) if lbl_dir.exists() else []
+
+        status = "✓" if (imgs and lbls) else "✗"
+        print(f"  {status}  {split:5s}: {len(imgs):5d} images | {len(lbls):5d} labels")
 
         if not imgs or not lbls: ok = False
     return ok
 
-def evaluate(weights: str, data_yaml: str = "data.yaml") -> dict:
-    import torch
-    from ultralytics import YOLO
-    torch.cuda.reset_peak_memory_stats()
-    results = YOLO(weights).val(data=data_yaml, imgsz=EVAL_IMGSZ, batch=EVAL_BATCH, workers=EVAL_WORKERS, conf=EVAL_CONF, iou=EVAL_IOU, verbose=False)
-    box = results.box
-    return {"val_mAP5095": float(box.map), "val_mAP50": float(box.map50)}
-
 def main():
-    parser = argparse.ArgumentParser(description="AutoResearch-DET setup & eval")
+    parser = argparse.ArgumentParser(description="AutoResearch-DET setup")
     parser.add_argument("--dataset-dir", default=os.environ.get("DATASET_DIR", ""))
     parser.add_argument("--output", default="data.yaml")
-    parser.add_argument("--staging-dir", default=os.environ.get("PREPARE_STAGING_DIR", ""))
-    parser.add_argument("--eval", action="store_true")
-    parser.add_argument("--weights", default="")
     parser.add_argument("--verify", action="store_true")
     args = parser.parse_args()
 
-    staging = (args.staging_dir or "").strip()
-    if staging:
-        out = Path(args.output)
-        if not out.is_absolute(): args.output = str(Path(staging) / out.name)
     output_resolved = _resolve_output_path(args.output)
 
-    if args.verify: sys.exit(0 if verify_dataset(output_resolved) else 1)
-    elif args.eval: evaluate(args.weights, output_resolved)
-    else: build_data_yaml(args.dataset_dir, output_resolved, staging_dir=staging or None)
+    if args.verify: 
+        sys.exit(0 if verify_dataset(output_resolved) else 1)
+    else: 
+        if not args.dataset_dir:
+            sys.exit("ERROR: Pass --dataset-dir or set DATASET_DIR environment variable.")
+        build_data_yaml(args.dataset_dir, output_resolved)
 
 if __name__ == "__main__":
     main()

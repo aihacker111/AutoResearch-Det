@@ -4,6 +4,7 @@ import subprocess
 import sys
 import threading
 import time
+import signal
 from config import Config
 
 class Trainer:
@@ -41,22 +42,42 @@ class Trainer:
                 try: stream.reconfigure(line_buffering=True)
                 except: pass
 
+    def _kill_process_tree(self, proc: subprocess.Popen):
+        """Forces the process and all zombie child workers to release GPU memory."""
+        try:
+            if sys.platform != "win32":
+                # Kill the entire process group (Linux/Mac)
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            else:
+                # Kill process tree (Windows)
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+        except Exception:
+            proc.kill()
+
     def run(self, timeout: float = None) -> tuple[bool, float]:
         cmd = self._build_cmd()
         env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
 
+        # IMPORTANT: Create a new process group so we can cleanly kill all zombie workers
+        popen_kwargs = {}
+        if sys.platform != "win32":
+            popen_kwargs["start_new_session"] = True
+
         if self.quiet:
             t0 = time.time()
+            proc = subprocess.Popen(cmd, cwd=str(Config.ROOT_DIR), stdout=open(Config.LOG_FILE, "w"), stderr=subprocess.STDOUT, env=env, **popen_kwargs)
             try:
-                with open(Config.LOG_FILE, "w") as log_out:
-                    proc = subprocess.run(cmd, cwd=str(Config.ROOT_DIR), stdout=log_out, stderr=subprocess.STDOUT, timeout=timeout, env=env)
-                return proc.returncode == 0, time.time() - t0
+                proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
+                self._kill_process_tree(proc)
                 return False, time.time() - t0
+            finally:
+                self._kill_process_tree(proc) # Ensure VRAM is cleared even on success
+            return proc.returncode == 0, time.time() - t0
 
         self._force_unbuffered_stdout()
         with open(Config.LOG_FILE, "w", buffering=1) as log_f:
-            proc = subprocess.Popen(cmd, cwd=str(Config.ROOT_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
+            proc = subprocess.Popen(cmd, cwd=str(Config.ROOT_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env, **popen_kwargs)
             return self._stream_process(proc, log_f, timeout)
 
     def _stream_process(self, proc: subprocess.Popen, log_f, timeout: float | None) -> tuple[bool, float]:
@@ -69,7 +90,7 @@ class Trainer:
                 time.sleep(timeout)
                 if proc.poll() is None:
                     timed_out = True
-                    proc.kill()
+                    self._kill_process_tree(proc)
 
         if timeout: threading.Thread(target=_watchdog, daemon=True).start()
 
@@ -96,6 +117,10 @@ class Trainer:
             sys.stdout.flush()
 
         rc = proc.wait()
+        
+        # Absolute guarantee to clear GPU VRAM after experiment ends
+        self._kill_process_tree(proc)
+        
         elapsed = time.time() - t0
         if timed_out: print(f"\n  [TIMEOUT] killed after {timeout:.0f}s")
         return rc == 0, elapsed
