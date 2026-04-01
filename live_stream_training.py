@@ -272,8 +272,7 @@ def _tick():
     rows = _state.history_rows or [["—"] * 8]
     pbar = _progress_html(_state.exp_done, _state.exp_total, _state.last_metrics)
 
-    chat = [[m["content"], None] if m["role"] == "user" else [None, m["content"]]
-            for m in _state.chat_messages]
+    chat = [{"role": m["role"], "content": str(m.get("content", ""))} for m in _state.chat_messages]
 
     return (
         chat,
