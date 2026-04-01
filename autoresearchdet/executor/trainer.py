@@ -5,9 +5,7 @@ import sys
 import threading
 import time
 import signal
-from config      import Config
-from executor.vram_manager import VRAMManager
-
+from config import Config
 
 class Trainer:
     PROGRESS_RE = re.compile(
@@ -26,96 +24,61 @@ class Trainer:
 
     def _detect_gpus(self) -> int:
         try:
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-                text=True, stderr=subprocess.DEVNULL,
-            )
+            out = subprocess.check_output(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], text=True, stderr=subprocess.DEVNULL)
             return max(len([l for l in out.strip().splitlines() if l.strip()]), 1)
         except Exception:
             return 1
 
     def _build_cmd(self) -> list[str]:
-        py    = sys.executable
+        py = sys.executable
         train = str(Config.TRAIN_FILE)
         if self.num_gpus <= 1:
             return [py, "-u", train]
-        return [py, "-u", "-m", "torch.distributed.run",
-                f"--nproc_per_node={self.num_gpus}", "--master_port=29500", train]
-
-    def _kill_process_tree(self, proc: subprocess.Popen):
-        """Kill process group so all DDP workers release GPU context."""
-        try:
-            if sys.platform != "win32":
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            else:
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
-        except Exception:
-            proc.kill()
+        return [py, "-u", "-m", "torch.distributed.run", f"--nproc_per_node={self.num_gpus}", "--master_port=29500", train]
 
     def _force_unbuffered_stdout(self):
         for stream in (sys.stdout, sys.stderr):
             if hasattr(stream, "reconfigure"):
-                try:
-                    stream.reconfigure(line_buffering=True)
-                except Exception:
-                    pass
+                try: stream.reconfigure(line_buffering=True)
+                except: pass
 
-    # ── VRAM-safe environment ─────────────────────────────────────────────
-    def _make_env(self) -> dict:
-        return VRAMManager.training_env({
-            **os.environ,
-            "PYTHONUNBUFFERED":  "1",
-            "PYTHONIOENCODING":  "utf-8",
-        })
+    def _kill_process_tree(self, proc: subprocess.Popen):
+        """Forces the process and all zombie child workers to release GPU memory."""
+        try:
+            if sys.platform != "win32":
+                # Kill the entire process group (Linux/Mac)
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            else:
+                # Kill process tree (Windows)
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+        except Exception:
+            proc.kill()
 
-    # ── Pre-run VRAM check ────────────────────────────────────────────────
-    def _pre_run_log(self):
-        VRAMManager.log_vram_state("pre-run  → ")
-
-    # ── Post-run VRAM cleanup ─────────────────────────────────────────────
-    def _post_run_cleanup(self, proc: subprocess.Popen):
-        """Kill process tree, then wait for VRAM to settle."""
-        self._kill_process_tree(proc)
-        VRAMManager.post_run_cooldown()
-        VRAMManager.log_vram_state("post-run → ")
-
-    # ── Public run() ─────────────────────────────────────────────────────
     def run(self, timeout: float = None) -> tuple[bool, float]:
         cmd = self._build_cmd()
-        env = self._make_env()
+        env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
 
+        # IMPORTANT: Create a new process group so we can cleanly kill all zombie workers
         popen_kwargs = {}
         if sys.platform != "win32":
             popen_kwargs["start_new_session"] = True
 
-        self._pre_run_log()
-
         if self.quiet:
-            t0   = time.time()
-            proc = subprocess.Popen(
-                cmd, cwd=str(Config.ROOT_DIR),
-                stdout=open(Config.LOG_FILE, "w"), stderr=subprocess.STDOUT,
-                env=env, **popen_kwargs,
-            )
+            t0 = time.time()
+            proc = subprocess.Popen(cmd, cwd=str(Config.ROOT_DIR), stdout=open(Config.LOG_FILE, "w"), stderr=subprocess.STDOUT, env=env, **popen_kwargs)
             try:
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                self._post_run_cleanup(proc)
+                self._kill_process_tree(proc)
                 return False, time.time() - t0
             finally:
-                self._post_run_cleanup(proc)
+                self._kill_process_tree(proc) # Ensure VRAM is cleared even on success
             return proc.returncode == 0, time.time() - t0
 
         self._force_unbuffered_stdout()
         with open(Config.LOG_FILE, "w", buffering=1) as log_f:
-            proc = subprocess.Popen(
-                cmd, cwd=str(Config.ROOT_DIR),
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, env=env, **popen_kwargs,
-            )
-            result = self._stream_process(proc, log_f, timeout)
-        self._post_run_cleanup(proc)
-        return result
+            proc = subprocess.Popen(cmd, cwd=str(Config.ROOT_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env, **popen_kwargs)
+            return self._stream_process(proc, log_f, timeout)
 
     def _stream_process(self, proc: subprocess.Popen, log_f, timeout: float | None) -> tuple[bool, float]:
         t0 = time.time()
@@ -129,13 +92,13 @@ class Trainer:
                     timed_out = True
                     self._kill_process_tree(proc)
 
-        if timeout:
-            threading.Thread(target=_watchdog, daemon=True).start()
+        if timeout: threading.Thread(target=_watchdog, daemon=True).start()
 
         try:
             for line in proc.stdout:
                 log_f.write(line)
                 log_f.flush()
+                
                 if bool(line.strip() and self.PROGRESS_RE.search(line.strip())):
                     display = line.rstrip("\n\r")[:self.TERM_WIDTH].ljust(self.TERM_WIDTH)
                     sys.stdout.write("\r" + display)
@@ -147,15 +110,17 @@ class Trainer:
                         on_prog_line = False
                     sys.stdout.write(line)
                     sys.stdout.flush()
-        except BrokenPipeError:
-            pass
+        except BrokenPipeError: pass
 
         if on_prog_line:
             sys.stdout.write("\n")
             sys.stdout.flush()
 
         rc = proc.wait()
+        
+        # Absolute guarantee to clear GPU VRAM after experiment ends
+        self._kill_process_tree(proc)
+        
         elapsed = time.time() - t0
-        if timed_out:
-            print(f"\n  [TIMEOUT] killed after {timeout:.0f}s")
+        if timed_out: print(f"\n  [TIMEOUT] killed after {timeout:.0f}s")
         return rc == 0, elapsed
