@@ -458,7 +458,6 @@ def build_ui():
             elem_id="agent-chat",
             height=420,
             show_label=False,
-            bubble_full_width=False,
             avatar_images=(
                 "https://api.dicebear.com/8.x/bottts/svg?seed=scientist&backgroundColor=1e3a5f",
                 "https://api.dicebear.com/8.x/bottts/svg?seed=engineer&backgroundColor=14291e",
