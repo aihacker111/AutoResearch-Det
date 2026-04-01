@@ -217,9 +217,26 @@ def main():
         print(f"peak_vram_mb:     {peak_vram:.1f}")
         print(f"checkpoint:       {exp_dir / 'weights/best.pt'}")
     finally:
+        # ── Explicit VRAM release ──────────────────────────────────────────
+        # Called before the process exits so the OS can reclaim the CUDA context
+        # immediately, preventing cumulative VRAM growth across experiments.
+        try:
+            import gc
+            import torch
+            try:
+                del model   # type: ignore[name-defined]
+            except NameError:
+                pass
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+        # ── Distributed teardown ───────────────────────────────────────────
         try:
             import torch.distributed as dist
-
             if dist.is_available() and dist.is_initialized():
                 dist.destroy_process_group()
         except Exception:

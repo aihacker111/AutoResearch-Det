@@ -58,8 +58,7 @@ class AutoResearchPipeline:
                 event_cb=self.event_cb,
             )
 
-        if threading.current_thread() is threading.main_thread():
-            signal.signal(signal.SIGINT, self._handle_sigint)
+        signal.signal(signal.SIGINT, self._handle_sigint)
 
     # ── Signal handling ───────────────────────────────────────────────────
 
